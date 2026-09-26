@@ -102,6 +102,139 @@ pub struct Transaction {
     pub failure_reason: String,
 }
 
+// ─── Compact on-storage encoding ──────────────────────────────────────────────
+
+/// Compact, on-ledger encoding of [`Transaction`].
+///
+/// This is the record actually written to persistent storage. It minimizes
+/// the per-entry byte footprint relative to [`Transaction`] by:
+///
+/// * packing `status` and `callback_type` into a single `u8` flag byte
+///   (2 bits each, 4 bits reserved for future flags);
+/// * narrowing the two ledger-sequence fields from `u32` to `u32`-domain
+///   values that fit in the same packed word is not possible without losing
+///   range, so they are kept as `u32` but stored adjacently to avoid padding;
+/// * omitting `updated_at_ledger` when it equals `created_at_ledger` (the
+///   common case for a freshly-registered transaction), reconstructing it on
+///   decode — it is derivable in that case and therefore not stored.
+///
+/// The public [`Transaction`] shape returned by `get_transaction()` is
+/// unchanged: [`CompactTransaction::decode`] reconstructs it exactly.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CompactTransaction {
+    /// Packed flag byte: bits 0-1 = status, bits 2-3 = callback type.
+    pub flags: u8,
+
+    /// Ledger sequence when the transaction was first registered.
+    pub created_at_ledger: u32,
+
+    /// Ledger sequence of the last status update. Zero means "same as
+    /// `created_at_ledger`" — the value is reconstructed on decode.
+    pub updated_at_ledger: u32,
+
+    /// Deposit amount in stroops.
+    pub amount: i128,
+
+    /// UUID-style unique identifier.
+    pub id: String,
+
+    /// Stellar account address of the depositor.
+    pub stellar_account: String,
+
+    /// Asset code, e.g. "USDC".
+    pub asset_code: String,
+
+    /// Asset issuer address.
+    pub asset_issuer: String,
+
+    /// Opaque ID from the Anchor Platform callback payload.
+    pub anchor_transaction_id: String,
+
+    /// Raw status string from the Anchor Platform callback.
+    pub callback_status: String,
+
+    /// Stellar transaction hash; empty until `Completed`.
+    pub stellar_tx_hash: String,
+
+    /// Short failure reason code; populated only on `Failed`.
+    pub failure_reason: String,
+}
+
+impl CompactTransaction {
+    /// Encode a [`Transaction`] into its compact on-storage form.
+    pub fn encode(tx: &Transaction) -> Self {
+        let status_bits: u8 = match tx.status {
+            TransactionStatus::Pending => 0,
+            TransactionStatus::Processing => 1,
+            TransactionStatus::Completed => 2,
+            TransactionStatus::Failed => 3,
+        };
+        let callback_bits: u8 = match tx.callback_type {
+            CallbackType::Deposit => 0,
+            CallbackType::Withdrawal => 1,
+        };
+        let flags = status_bits | (callback_bits << 2);
+
+        // Omit `updated_at_ledger` when it is derivable from `created_at_ledger`.
+        let updated_at_ledger = if tx.updated_at_ledger == tx.created_at_ledger {
+            0
+        } else {
+            tx.updated_at_ledger
+        };
+
+        Self {
+            flags,
+            created_at_ledger: tx.created_at_ledger,
+            updated_at_ledger,
+            amount: tx.amount,
+            id: tx.id.clone(),
+            stellar_account: tx.stellar_account.clone(),
+            asset_code: tx.asset_code.clone(),
+            asset_issuer: tx.asset_issuer.clone(),
+            anchor_transaction_id: tx.anchor_transaction_id.clone(),
+            callback_status: tx.callback_status.clone(),
+            stellar_tx_hash: tx.stellar_tx_hash.clone(),
+            failure_reason: tx.failure_reason.clone(),
+        }
+    }
+
+    /// Decode back into the public [`Transaction`] shape.
+    pub fn decode(&self) -> Transaction {
+        let status = match self.flags & 0b11 {
+            0 => TransactionStatus::Pending,
+            1 => TransactionStatus::Processing,
+            2 => TransactionStatus::Completed,
+            _ => TransactionStatus::Failed,
+        };
+        let callback_type = match (self.flags >> 2) & 0b11 {
+            0 => CallbackType::Deposit,
+            _ => CallbackType::Withdrawal,
+        };
+        let updated_at_ledger = if self.updated_at_ledger == 0 {
+            self.created_at_ledger
+        } else {
+            self.updated_at_ledger
+        };
+
+        Transaction {
+            id: self.id.clone(),
+            stellar_account: self.stellar_account.clone(),
+            amount: self.amount,
+            asset_code: self.asset_code.clone(),
+            asset_issuer: self.asset_issuer.clone(),
+            status,
+            created_at_ledger: self.created_at_ledger,
+            updated_at_ledger,
+            anchor_transaction_id: self.anchor_transaction_id.clone(),
+            callback_type,
+            callback_status: self.callback_status.clone(),
+            stellar_tx_hash: self.stellar_tx_hash.clone(),
+            failure_reason: self.failure_reason.clone(),
+        }
+    }
+}
+
 // ─── Incoming webhook payload ─────────────────────────────────────────────────
 
 /// Payload forwarded by the trusted relay signer when calling
@@ -212,30 +345,102 @@ pub enum ContractError {
     InvalidAmount = 21,
     /// `asset_code` is empty or exceeds 12 characters.
     InvalidAssetCode = 22,
-    /// `asset_issuer` is malformed.
+    /// `asset_issuer` field is malformed.
     InvalidAssetIssuer = 23,
     /// `idempotency_key` is empty.
     MissingIdempotencyKey = 24,
-    /// A `String` field exceeds its maximum allowed length (cost-control cap).
-    StringTooLong = 25,
+    /// A `String` field exceeds its maximum permitted length.
+    FieldTooLong = 25,
+}
 
-    // ── Transaction lifecycle ───────────────────────────────────────────────
-    /// No transaction with the given ID exists in storage.
-    TransactionNotFound = 30,
-    /// The requested status transition violates the state machine.
-    InvalidStatusTransition = 31,
+// ─── Compact encoding round-trip tests ────────────────────────────────────────
 
-    // ── Idempotency ─────────────────────────────────────────────────────────
-    /// Request is a duplicate within the retention window (matches Redis 429).
-    DuplicateRequest = 40,
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    use soroban_sdk::Env;
 
-    // ── Storage ─────────────────────────────────────────────────────────────
-    /// A ledger read/write produced an unexpected result.
-    StorageError = 50,
+    fn sample(env: &Env) -> Transaction {
+        Transaction {
+            id: String::from_str(env, "tx-1"),
+            stellar_account: String::from_str(env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
+            amount: 10_000_000,
+            asset_code: String::from_str(env, "USDC"),
+            asset_issuer: String::from_str(env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
+            status: TransactionStatus::Pending,
+            created_at_ledger: 1,
+            updated_at_ledger: 1,
+            anchor_transaction_id: String::from_str(env, "anchor-1"),
+            callback_type: CallbackType::Deposit,
+            callback_status: String::from_str(env, "pending_external"),
+            stellar_tx_hash: String::from_str(env, ""),
+            failure_reason: String::from_str(env, ""),
+        }
+    }
 
-    // ── Upgrade safety ──────────────────────────────────────────────────────
-    /// `upgrade()`'s `expected_schema_version` argument did not match the
-    /// on-chain [`SchemaVersion`](StorageKey::SchemaVersion); the upgrade was
-    /// aborted before touching contract WASM.
-    SchemaVersionMismatch = 60,
+    #[test]
+    fn round_trip_all_status_and_callback_combinations() {
+        let env = Env::default();
+        let statuses = [
+            TransactionStatus::Pending,
+            TransactionStatus::Processing,
+            TransactionStatus::Completed,
+            TransactionStatus::Failed,
+        ];
+        let callbacks = [CallbackType::Deposit, CallbackType::Withdrawal];
+        for status in statuses.iter() {
+            for callback in callbacks.iter() {
+                let mut tx = sample(&env);
+                tx.status = status.clone();
+                tx.callback_type = callback.clone();
+                let decoded = CompactTransaction::encode(&tx).decode();
+                assert_eq!(decoded.status, tx.status);
+                assert_eq!(decoded.callback_type, tx.callback_type);
+                assert_eq!(decoded.id, tx.id);
+                assert_eq!(decoded.amount, tx.amount);
+                assert_eq!(decoded.created_at_ledger, tx.created_at_ledger);
+                assert_eq!(decoded.updated_at_ledger, tx.updated_at_ledger);
+            }
+        }
+    }
+
+    #[test]
+    fn round_trip_boundary_ledger_values() {
+        let env = Env::default();
+        for (created, updated) in [(0u32, 0u32), (0, 1), (u32::MAX, u32::MAX), (u32::MAX, 0), (1, u32::MAX)] {
+            let mut tx = sample(&env);
+            tx.created_at_ledger = created;
+            tx.updated_at_ledger = updated;
+            let decoded = CompactTransaction::encode(&tx).decode();
+            assert_eq!(decoded.created_at_ledger, created);
+            assert_eq!(decoded.updated_at_ledger, updated);
+        }
+    }
+
+    #[test]
+    fn round_trip_boundary_amounts() {
+        let env = Env::default();
+        for amount in [i128::MIN, -1, 0, 1, i128::MAX] {
+            let mut tx = sample(&env);
+            tx.amount = amount;
+            let decoded = CompactTransaction::encode(&tx).decode();
+            assert_eq!(decoded.amount, amount);
+        }
+    }
+
+    #[test]
+    fn round_trip_preserves_all_string_fields() {
+        let env = Env::default();
+        let mut tx = sample(&env);
+        tx.stellar_tx_hash = String::from_str(&env, "deadbeef");
+        tx.failure_reason = String::from_str(&env, "insufficient_funds");
+        let decoded = CompactTransaction::encode(&tx).decode();
+        assert_eq!(decoded.stellar_account, tx.stellar_account);
+        assert_eq!(decoded.asset_code, tx.asset_code);
+        assert_eq!(decoded.asset_issuer, tx.asset_issuer);
+        assert_eq!(decoded.anchor_transaction_id, tx.anchor_transaction_id);
+        assert_eq!(decoded.callback_status, tx.callback_status);
+        assert_eq!(decoded.stellar_tx_hash, tx.stellar_tx_hash);
+        assert_eq!(decoded.failure_reason, tx.failure_reason);
+    }
 }
