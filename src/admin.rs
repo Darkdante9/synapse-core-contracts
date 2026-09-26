@@ -14,6 +14,18 @@ use soroban_sdk::{Address, Env};
 use crate::storage::StorageClient;
 use crate::types::ContractError;
 
+/// Hard-coded lower bound for the admin-configurable idempotency-key TTL, in
+/// ledgers.  Roughly one hour at ~5s per ledger.  Values below this are
+/// rejected at configuration time so the dedup window cannot be tuned into
+/// something dangerously short.
+pub const MIN_IDEMPOTENCY_TTL_LEDGERS: u32 = 720;
+
+/// Hard-coded upper bound for the admin-configurable idempotency-key TTL, in
+/// ledgers.  Roughly seven days at ~5s per ledger.  Values above this are
+/// rejected at configuration time so temporary-storage rent cannot be tuned
+/// into something wastefully long.
+pub const MAX_IDEMPOTENCY_TTL_LEDGERS: u32 = 120_960;
+
 pub struct AdminClient;
 
 impl AdminClient {
@@ -49,6 +61,22 @@ impl AdminClient {
             return Err(ContractError::NotRelaySigner);
         }
         caller.require_auth();
+        Ok(())
+    }
+
+    /// Validate a proposed idempotency-key TTL (in ledgers) against the
+    /// hard-coded `MIN_IDEMPOTENCY_TTL_LEDGERS` / `MAX_IDEMPOTENCY_TTL_LEDGERS`
+    /// bounds.
+    ///
+    /// Returns `Err(ContractError::InvalidIdempotencyTtl)` when the value is
+    /// out of bounds, so misconfiguration is rejected at configuration time
+    /// rather than silently applied.
+    pub fn validate_idempotency_ttl(ttl_ledgers: u32) -> Result<(), ContractError> {
+        if ttl_ledgers < MIN_IDEMPOTENCY_TTL_LEDGERS
+            || ttl_ledgers > MAX_IDEMPOTENCY_TTL_LEDGERS
+        {
+            return Err(ContractError::InvalidIdempotencyTtl);
+        }
         Ok(())
     }
 }

@@ -9,17 +9,29 @@
 //! |-----------------------|------------|--------------------------------------------|
 //! | Admin, relay signer   | `persistent` | Must survive archive/restore cycles      |
 //! | Transactions          | `persistent` | Long-lived; needed for audit trail       |
-//! | Idempotency keys      | `temporary`  | 24-hour TTL; evicted by the ledger       |
+//! | Idempotency keys      | `temporary`  | Admin-tunable TTL; evicted by the ledger |
 //! | Initialised flag      | `instance`   | Lives with the contract instance         |
 
 use soroban_sdk::{Address, Env, String};
 
 use crate::types::{ContractError, StorageKey, Transaction};
 
-/// TTL extension in ledgers applied to idempotency keys (~24 hours at ~5s/ledger).
+/// Default TTL in ledgers applied to idempotency keys (~24 hours at ~5s/ledger).
 ///
 /// 24 * 3600 / 5 = 17_280 ledgers.  We round up to 18_000 for safety.
-const IDEMPOTENCY_TTL_LEDGERS: u32 = 18_000;
+pub const DEFAULT_IDEMPOTENCY_TTL_LEDGERS: u32 = 18_000;
+
+/// Hard-coded lower bound for the admin-tunable idempotency-key TTL.
+///
+/// ~1 hour at ~5s/ledger (3600 / 5 = 720).  Anything shorter risks evicting
+/// keys before the off-chain retry window has elapsed, defeating deduplication.
+pub const MIN_IDEMPOTENCY_TTL_LEDGERS: u32 = 720;
+
+/// Hard-coded upper bound for the admin-tunable idempotency-key TTL.
+///
+/// ~7 days at ~5s/ledger (7 * 24 * 3600 / 5 = 120_960).  Anything longer
+/// wastes temporary-storage rent on keys that can no longer be replayed.
+pub const MAX_IDEMPOTENCY_TTL_LEDGERS: u32 = 120_960;
 
 /// Minimum TTL we require on transaction records before extending.
 const TRANSACTION_MIN_TTL_LEDGERS: u32 = 100_000; // ~1 week
@@ -127,6 +139,31 @@ impl StorageClient {
             .set(&StorageKey::SchemaVersion, &version);
     }
 
+    // ── Idempotency TTL parameter ─────────────────────────────────────────────
+
+    /// Read the admin-configured idempotency-key TTL in ledgers.
+    ///
+    /// Falls back to [`DEFAULT_IDEMPOTENCY_TTL_LEDGERS`] when the parameter has
+    /// never been set, so a freshly initialised contract keeps the historical
+    /// ~24-hour window without requiring an explicit configuration call.
+    pub fn get_idempotency_ttl(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::IdempotencyTtl)
+            .unwrap_or(DEFAULT_IDEMPOTENCY_TTL_LEDGERS)
+    }
+
+    /// Persist the admin-configured idempotency-key TTL in ledgers.
+    ///
+    /// The caller is responsible for validating `ttl` against
+    /// [`MIN_IDEMPOTENCY_TTL_LEDGERS`] / [`MAX_IDEMPOTENCY_TTL_LEDGERS`] before
+    /// invoking this; out-of-bounds values are rejected at configuration time.
+    pub fn set_idempotency_ttl(env: &Env, ttl: u32) {
+        env.storage()
+            .instance()
+            .set(&StorageKey::IdempotencyTtl, &ttl);
+    }
+
     // ── Transactions ──────────────────────────────────────────────────────────
 
     /// Returns `true` if a transaction record already exists for `tx_id`.
@@ -180,16 +217,19 @@ impl StorageClient {
             .get::<StorageKey, u32>(&StorageKey::IdempotencyKey(key.clone()))
     }
 
-    /// Record an idempotency key with a ~24-hour TTL.
+    /// Record an idempotency key using the admin-configured TTL.
+    ///
+    /// The TTL is read from [`Self::get_idempotency_ttl`] at write time, so a
+    /// parameter change only affects keys written after it — keys already in
+    /// flight keep the TTL they were written with.
     pub fn set_idempotency_key(env: &Env, key: &String) {
         let storage_key = StorageKey::IdempotencyKey(key.clone());
         env.storage()
             .temporary()
             .set(&storage_key, &env.ledger().sequence());
-        env.storage().temporary().extend_ttl(
-            &storage_key,
-            IDEMPOTENCY_TTL_LEDGERS,
-            IDEMPOTENCY_TTL_LEDGERS,
-        );
+        let ttl = Self::get_idempotency_ttl(env);
+        env.storage()
+            .temporary()
+            .extend_ttl(&storage_key, ttl, ttl);
     }
 }
