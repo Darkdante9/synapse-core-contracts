@@ -26,6 +26,19 @@ pub const MIN_IDEMPOTENCY_TTL_LEDGERS: u32 = 720;
 /// into something wastefully long.
 pub const MAX_IDEMPOTENCY_TTL_LEDGERS: u32 = 120_960;
 
+/// Hard-coded lower bound for the admin-configurable archival retention
+/// period, in ledgers.  Roughly one day at ~5s per ledger.  Values below this
+/// are rejected at configuration time so a terminal-state transaction cannot
+/// be evicted before off-chain indexers have had a reasonable window to
+/// capture its full detail.
+pub const MIN_ARCHIVAL_RETENTION_LEDGERS: u32 = 17_280;
+
+/// Hard-coded upper bound for the admin-configurable archival retention
+/// period, in ledgers.  Roughly ten years at ~5s per ledger.  Values above
+/// this are rejected at configuration time so the retention period cannot be
+/// tuned into something effectively unbounded.
+pub const MAX_ARCHIVAL_RETENTION_LEDGERS: u32 = 63_072_000;
+
 pub struct AdminClient;
 
 impl AdminClient {
@@ -76,6 +89,22 @@ impl AdminClient {
             || ttl_ledgers > MAX_IDEMPOTENCY_TTL_LEDGERS
         {
             return Err(ContractError::InvalidIdempotencyTtl);
+        }
+        Ok(())
+    }
+
+    /// Validate a proposed archival retention period (in ledgers) against the
+    /// hard-coded `MIN_ARCHIVAL_RETENTION_LEDGERS` /
+    /// `MAX_ARCHIVAL_RETENTION_LEDGERS` bounds.
+    ///
+    /// Returns `Err(ContractError::InvalidArchivalRetention)` when the value is
+    /// out of bounds, so misconfiguration is rejected at configuration time
+    /// rather than silently applied.
+    pub fn validate_archival_retention(retention_ledgers: u32) -> Result<(), ContractError> {
+        if retention_ledgers < MIN_ARCHIVAL_RETENTION_LEDGERS
+            || retention_ledgers > MAX_ARCHIVAL_RETENTION_LEDGERS
+        {
+            return Err(ContractError::InvalidArchivalRetention);
         }
         Ok(())
     }

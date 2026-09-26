@@ -36,6 +36,13 @@ pub const MAX_IDEMPOTENCY_TTL_LEDGERS: u32 = 120_960;
 /// Minimum TTL we require on transaction records before extending.
 const TRANSACTION_MIN_TTL_LEDGERS: u32 = 100_000; // ~1 week
 
+/// Default archival retention period in ledgers (~30 days at ~5s/ledger).
+///
+/// Terminal-state transactions younger than this are rejected by
+/// [`StorageClient::archive_transaction`], giving off-chain indexers a
+/// generous window to capture full detail before eviction.
+pub const DEFAULT_ARCHIVE_RETENTION_LEDGERS: u32 = 518_400;
+
 pub struct StorageClient;
 
 impl StorageClient {
@@ -164,6 +171,27 @@ impl StorageClient {
             .set(&StorageKey::IdempotencyTtl, &ttl);
     }
 
+    // ── Archival retention parameter ──────────────────────────────────────────
+
+    /// Read the admin-configured archival retention period in ledgers.
+    ///
+    /// Falls back to [`DEFAULT_ARCHIVE_RETENTION_LEDGERS`] when the parameter
+    /// has never been set, so a freshly initialised contract keeps a sensible
+    /// ~30-day window without requiring an explicit configuration call.
+    pub fn get_archive_retention(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::ArchiveRetention)
+            .unwrap_or(DEFAULT_ARCHIVE_RETENTION_LEDGERS)
+    }
+
+    /// Persist the admin-configured archival retention period in ledgers.
+    pub fn set_archive_retention(env: &Env, retention: u32) {
+        env.storage()
+            .instance()
+            .set(&StorageKey::ArchiveRetention, &retention);
+    }
+
     // ── Transactions ──────────────────────────────────────────────────────────
 
     /// Returns `true` if a transaction record already exists for `tx_id`.
@@ -207,29 +235,18 @@ impl StorageClient {
         );
     }
 
-    // ── Idempotency keys ──────────────────────────────────────────────────────
-
-    /// Return the ledger sequence at which an idempotency key was first stored,
-    /// or `None` if the key is unknown / expired.
-    pub fn get_idempotency_key(env: &Env, key: &String) -> Option<u32> {
-        env.storage()
-            .temporary()
-            .get::<StorageKey, u32>(&StorageKey::IdempotencyKey(key.clone()))
-    }
-
-    /// Record an idempotency key using the admin-configured TTL.
+    /// Evict a [`Transaction`] record from active persistent storage.
     ///
-    /// The TTL is read from [`Self::get_idempotency_ttl`] at write time, so a
-    /// parameter change only affects keys written after it — keys already in
-    /// flight keep the TTL they were written with.
-    pub fn set_idempotency_key(env: &Env, key: &String) {
-        let storage_key = StorageKey::IdempotencyKey(key.clone());
+    /// This is the explicit-eviction half of the archival mechanism: the
+    /// caller (see `SynapseCoreContract::archive_transaction`) is responsible
+    /// for having validated terminal state and retention eligibility, and for
+    /// emitting `EventTransactionArchived` with the full record so off-chain
+    /// indexers retain the audit trail.  After this call the transaction is no
+    /// longer returned by active-state queries such as
+    /// `get_transactions_by_status`.
+    pub fn remove_transaction(env: &Env, tx_id: &String) {
         env.storage()
-            .temporary()
-            .set(&storage_key, &env.ledger().sequence());
-        let ttl = Self::get_idempotency_ttl(env);
-        env.storage()
-            .temporary()
-            .extend_ttl(&storage_key, ttl, ttl);
+            .persistent()
+            .remove(&StorageKey::Transaction(tx_id.clone()));
     }
 }
