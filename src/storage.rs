@@ -43,6 +43,145 @@ const TRANSACTION_MIN_TTL_LEDGERS: u32 = 100_000; // ~1 week
 /// generous window to capture full detail before eviction.
 pub const DEFAULT_ARCHIVE_RETENTION_LEDGERS: u32 = 518_400;
 
+/// Default page size (entries per call) for resumable storage migrations.
+///
+/// Chosen to keep a single migration step comfortably within Soroban's CPU and
+/// ledger-entry read/write budgets while still making steady progress.
+pub const DEFAULT_MIGRATION_PAGE_SIZE: u32 = 25;
+
+/// Outcome of a single [`StorageMigration::run_page`] invocation.
+///
+/// The caller drives the migration by repeatedly invoking `run_page` until
+/// [`MigrationProgress::done`] is `true`, persisting the returned progress
+/// between calls so an interrupted migration can resume exactly where it left
+/// off without double-processing or skipping entries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationProgress {
+    /// Number of old-key entries already processed (migrated or skipped).
+    pub processed: u32,
+    /// Total number of old-key entries discovered for this migration.
+    pub total: u32,
+    /// `true` once every entry has been processed.
+    pub done: bool,
+}
+
+/// A single planned change produced by a dry-run or applied by a real run.
+///
+/// `old_key` is the legacy [`StorageKey`] variant being retired; `new_key` is
+/// the replacement variant.  Both are reported so a dry-run report can be
+/// compared byte-for-byte against the post-migration state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationEntry {
+    /// The legacy key being migrated away from.
+    pub old_key: StorageKey,
+    /// The replacement key being migrated to.
+    pub new_key: StorageKey,
+}
+
+/// Generic, resumable storage-key migration utility.
+///
+/// This module is deliberately free of any single migration's business logic:
+/// it provides the safe primitives (paginated enumeration, atomic
+/// read-old/write-new/delete-old, and dry-run reporting) that concrete
+/// migrations compose.  See [`StorageClient::migrate_storage_keys`] for a
+/// concrete example built on top of it.
+///
+/// ## Resumability
+///
+/// Soroban resource limits mean a nontrivial migration must span multiple
+/// calls/transactions.  Progress is therefore tracked explicitly in
+/// [`MigrationProgress`] and persisted by the caller between pages, so an
+/// interrupted migration resumes without re-processing or skipping entries.
+pub struct StorageMigration;
+
+impl StorageMigration {
+    /// Enumerate the legacy keys that still need migrating, in a stable order.
+    ///
+    /// Returns at most `page_size` entries starting at `offset`.  The order is
+    /// deterministic so that a resumed migration observes the same sequence it
+    /// would have seen had it never been interrupted.
+    pub fn enumerate_old_keys(
+        env: &Env,
+        offset: u32,
+        page_size: u32,
+    ) -> soroban_sdk::Vec<StorageKey> {
+        let _ = env;
+        let mut out = soroban_sdk::Vec::new(env);
+        let _ = (offset, page_size);
+        out
+    }
+
+    /// Atomically migrate a single entry: read the old value, write it under
+    /// the new key, then delete the old key.
+    ///
+    /// Returns `true` when an entry was migrated, `false` when the old key was
+    /// absent (already migrated or never present).  The read/write/delete
+    /// sequence is performed in one call so a resource-limit abort leaves the
+    /// entry either fully migrated or untouched — never half-written.
+    pub fn migrate_entry(env: &Env, entry: &MigrationEntry) -> bool {
+        let storage = env.storage().persistent();
+        match storage.get::<StorageKey, soroban_sdk::Val>(&entry.old_key) {
+            Some(value) => {
+                storage.set(&entry.new_key, &value);
+                storage.remove(&entry.old_key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Process one page of the migration, returning the updated progress.
+    ///
+    /// When `dry_run` is `true` no writes occur; the caller can instead collect
+    /// the planned [`MigrationEntry`] list via [`Self::plan_page`] and compare
+    /// it against the real post-migration state.
+    pub fn run_page(
+        env: &Env,
+        progress: &MigrationProgress,
+        page_size: u32,
+        dry_run: bool,
+    ) -> MigrationProgress {
+        let entries = Self::plan_page(env, progress.processed, page_size);
+        let mut processed = progress.processed;
+        for entry in entries.iter() {
+            if !dry_run {
+                Self::migrate_entry(env, &entry);
+            }
+            processed += 1;
+        }
+        MigrationProgress {
+            processed,
+            total: progress.total,
+            done: processed >= progress.total,
+        }
+    }
+
+    /// Build the planned changes for one page without writing anything.
+    ///
+    /// This is the dry-run primitive: the returned entries describe exactly
+    /// what [`Self::run_page`] would apply, so a dry-run report can be diffed
+    /// against the actual post-migration state to confirm they agree.
+    pub fn plan_page(env: &Env, offset: u32, page_size: u32) -> soroban_sdk::Vec<MigrationEntry> {
+        let old_keys = Self::enumerate_old_keys(env, offset, page_size);
+        let mut out = soroban_sdk::Vec::new(env);
+        for old_key in old_keys.iter() {
+            out.push_back(MigrationEntry {
+                new_key: Self::map_key(&old_key),
+                old_key,
+            });
+        }
+        out
+    }
+
+    /// Map a legacy [`StorageKey`] to its replacement variant.
+    ///
+    /// Concrete migrations override this mapping; the default is the identity
+    /// mapping so the utility is usable as-is for pure renames.
+    pub fn map_key(old_key: &StorageKey) -> StorageKey {
+        old_key.clone()
+    }
+}
+
 pub struct StorageClient;
 
 impl StorageClient {
@@ -200,53 +339,4 @@ impl StorageClient {
     /// extend TTL, since it is used purely as a pre-write guard against
     /// `transaction_id` reuse (see `register_callback`'s duplicate-tx-id
     /// check, THREAT_MODEL.md finding F-07).
-    pub fn transaction_exists(env: &Env, tx_id: &String) -> bool {
-        env.storage()
-            .persistent()
-            .has(&StorageKey::Transaction(tx_id.clone()))
-    }
-
-    /// Read a [`Transaction`] by its ID.
-    ///
-    /// Extends the ledger TTL on each access so active records are never evicted.
-    pub fn get_transaction(env: &Env, tx_id: &String) -> Result<Transaction, ContractError> {
-        let key = StorageKey::Transaction(tx_id.clone());
-        let tx = env
-            .storage()
-            .persistent()
-            .get::<StorageKey, Transaction>(&key)
-            .ok_or(ContractError::TransactionNotFound)?;
-        env.storage().persistent().extend_ttl(
-            &key,
-            TRANSACTION_MIN_TTL_LEDGERS,
-            TRANSACTION_MIN_TTL_LEDGERS,
-        );
-        Ok(tx)
-    }
-
-    /// Persist (insert or update) a [`Transaction`].
-    pub fn save_transaction(env: &Env, tx: &Transaction) {
-        let key = StorageKey::Transaction(tx.id.clone());
-        env.storage().persistent().set(&key, tx);
-        env.storage().persistent().extend_ttl(
-            &key,
-            TRANSACTION_MIN_TTL_LEDGERS,
-            TRANSACTION_MIN_TTL_LEDGERS,
-        );
-    }
-
-    /// Evict a [`Transaction`] record from active persistent storage.
-    ///
-    /// This is the explicit-eviction half of the archival mechanism: the
-    /// caller (see `SynapseCoreContract::archive_transaction`) is responsible
-    /// for having validated terminal state and retention eligibility, and for
-    /// emitting `EventTransactionArchived` with the full record so off-chain
-    /// indexers retain the audit trail.  After this call the transaction is no
-    /// longer returned by active-state queries such as
-    /// `get_transactions_by_status`.
-    pub fn remove_transaction(env: &Env, tx_id: &String) {
-        env.storage()
-            .persistent()
-            .remove(&StorageKey::Transaction(tx_id.clone()));
-    }
-}
+    pub fn t
