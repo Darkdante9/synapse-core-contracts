@@ -47,7 +47,8 @@ supported.
 | [`EventContractUpgraded`](#eventcontractupgraded) | `upgrade` | `EventEmitter::contract_upgraded` | `upgrade` | **Live** |
 | [`EventStatusChanged`](#eventstatuschanged) | `status` | `EventEmitter::status_changed` | `start_processing`, `complete_transaction`, `fail_transaction` | **Live** |
 | [`EventTransactionCompleted`](#eventtransactioncompleted) | `done` | `EventEmitter::transaction_completed` | `complete_transaction` | **Live** |
-| [`EventTransactionFailed`](#eventtransactionfailed) | `fail` | `EventEmitter::transaction_failed` | `fail_transaction` | **Live** |
+| [`EventTransactionFailed`](#eventtransactionfailed) | `fail` | `EventEmitter::transaction_failed` | `complete_transaction` (route configured) | 1. `status`<br>2. `done`<br>3. `fwd` (`EventForwardingIntent { tx_id, next_phase }`, additive) |
+| `fail_transaction` | **Live** |
 | [`EventAdminTransferProposed`](#eventadmintransferproposed) | `propose` | `EventEmitter::admin_transfer_proposed` | `propose_admin` | **Live** |
 | [`EventAdminTransferred`](#eventadmintransferred) | `admin` | `EventEmitter::admin_transferred` | `accept_admin` | **Live** |
 | [`EventRelaySignerRotated`](#eventrelaysignerrotated) | `relay` | `EventEmitter::relay_signer_rotated` | `set_relay_signer` | **Live** |
@@ -324,3 +325,8 @@ Before merging any PR that touches `src/events.rs` or event emit sites in
 - Status enum: [`src/types.rs`](./src/types.rs) (`TransactionStatus`)
 - Upgradability / admin trust: [`DECISIONS.md`](./DECISIONS.md)
 - Version probe: `SynapseCoreContract::version`
+
+## Addendum: `merged` event
+
+`EventTransactionsMerged { canonical_tx_id, duplicate_tx_id, admin, reason, ledger }`,
+topic `merged`, emitted once by `merge_duplicate_transactions` (break-glass admin action).

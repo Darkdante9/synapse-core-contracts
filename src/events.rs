@@ -218,6 +218,63 @@ pub struct EventPauseToggled {
     pub ledger: u32,
 }
 
+/// Emitted by [`SynapseCoreContract::merge_duplicate_transactions`] when an
+/// admin links a duplicate record to its canonical original (break-glass).
+#[contracttype]
+pub struct EventTransactionsMerged {
+    pub canonical_tx_id: String,
+    pub duplicate_tx_id: String,
+    pub admin: soroban_sdk::Address,
+    pub reason: String,
+    pub ledger: u32,
+}
+
+/// Emitted by [`SynapseCoreContract::complete_transaction`], strictly after
+/// `status` and `done`, only when a non-zero forwarding route is configured.
+/// Purely a signal for a future downstream phase; no cross-contract call.
+#[contracttype]
+pub struct EventForwardingIntent {
+    pub tx_id: String,
+    pub next_phase: u32,
+}
+
+/// Emitted when a signer is added to the relay signer set.
+#[contracttype]
+pub struct EventRelaySignerAdded {
+    pub signer: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
+/// Emitted when a signer is removed from the relay signer set.
+#[contracttype]
+pub struct EventRelaySignerRemoved {
+    pub signer: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
+/// Emitted when the relay quorum threshold changes.
+#[contracttype]
+pub struct EventRelayThresholdChanged {
+    pub old_threshold: u32,
+    pub new_threshold: u32,
+    pub ledger: u32,
+}
+
+/// Emitted by `propose_relay_signer`; the rotation is not yet effective.
+#[contracttype]
+pub struct EventRelaySignerProposed {
+    pub proposed_signer: soroban_sdk::Address,
+    pub eta_ledger: u32,
+    pub ledger: u32,
+}
+
+/// Emitted by `cancel_relay_signer_change`.
+#[contracttype]
+pub struct EventRelaySignerChangeCancelled {
+    pub cancelled_signer: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
 // ─── Emitter ─────────────────────────────────────────────────────────────────
 
 pub struct EventEmitter;
@@ -299,6 +356,94 @@ impl EventEmitter {
             EventRelaySignerRotated {
                 old_signer: old_signer.clone(),
                 new_signer: new_signer.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventTransactionsMerged`].
+    pub fn transactions_merged(
+        env: &Env,
+        canonical_tx_id: &String,
+        duplicate_tx_id: &String,
+        admin: &soroban_sdk::Address,
+        reason: &String,
+    ) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("merged")),
+            EventTransactionsMerged {
+                canonical_tx_id: canonical_tx_id.clone(),
+                duplicate_tx_id: duplicate_tx_id.clone(),
+                admin: admin.clone(),
+                reason: reason.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventForwardingIntent`].
+    pub fn forwarding_intent(env: &Env, tx_id: &String, next_phase: u32) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("fwd")),
+            EventForwardingIntent {
+                tx_id: tx_id.clone(),
+                next_phase,
+            },
+        );
+    }
+
+    /// Emit [`EventRelaySignerAdded`].
+    pub fn relay_signer_added(env: &Env, signer: &soroban_sdk::Address) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("rs_add")),
+            EventRelaySignerAdded {
+                signer: signer.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventRelaySignerRemoved`].
+    pub fn relay_signer_removed(env: &Env, signer: &soroban_sdk::Address) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("rs_rm")),
+            EventRelaySignerRemoved {
+                signer: signer.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventRelayThresholdChanged`].
+    pub fn relay_threshold_changed(env: &Env, old_threshold: u32, new_threshold: u32) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("rs_thr")),
+            EventRelayThresholdChanged {
+                old_threshold,
+                new_threshold,
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventRelaySignerProposed`].
+    pub fn relay_signer_proposed(env: &Env, proposed: &soroban_sdk::Address, eta_ledger: u32) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("rs_prop")),
+            EventRelaySignerProposed {
+                proposed_signer: proposed.clone(),
+                eta_ledger,
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventRelaySignerChangeCancelled`].
+    pub fn relay_signer_change_cancelled(env: &Env, cancelled: &soroban_sdk::Address) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("rs_canc")),
+            EventRelaySignerChangeCancelled {
+                cancelled_signer: cancelled.clone(),
                 ledger: env.ledger().sequence(),
             },
         );

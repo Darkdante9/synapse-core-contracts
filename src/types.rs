@@ -248,6 +248,40 @@ pub enum StorageKey {
     Disputed(String),
     AnchorCeiling(String),
     DefaultCeiling,
+    /// Merge marker: duplicate tx id -> canonical tx id it was merged into.
+    MergedInto(String),
+    /// Per-transaction forwarding route (`next_phase`); absent = no forwarding.
+    ForwardRoute(String),
+    /// Singleton: N-of-M relay signer set ([`RelaySignerSet`]). Absent on
+    /// pre-#65 deployments; the legacy `RelaySigner` key is then migrated
+    /// lazily to `threshold = 1, signers = [relay_signer]`.
+    RelaySignerSet,
+    /// Temporary: a signer's standing approval for the next gated relay call.
+    RelayApproval(Address),
+    /// Singleton: pending timelocked relay-signer change.
+    PendingRelaySigner,
+    /// Singleton: timelock delay in ledgers (absent = default).
+    RelaySignerDelay,
+}
+
+/// Pending timelocked relay-signer rotation, finalisable at `eta_ledger`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingRelaySigner {
+    pub new_signer: Address,
+    pub eta_ledger: u32,
+}
+
+/// Default relay-signer timelock: ~24h at ~5s/ledger.
+pub const DEFAULT_RELAY_SIGNER_DELAY_LEDGERS: u32 = 17_280;
+
+/// N-of-M relay signer set: `threshold` distinct members must co-authorise
+/// each relay-gated call.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelaySignerSet {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -359,4 +393,30 @@ pub enum ContractError {
     // ── Amount ceilings ─────────────────────────────────────────────────────
     /// Amount exceeds the anchor's (or the default) ceiling.
     AmountCeilingExceeded = 92,
+
+    // ── Recovery / merge (100+ range) ───────────────────────────────────────
+    /// `merge_duplicate_transactions` was given the same id for both sides.
+    MergeSelf = 100,
+    /// The duplicate (or canonical) record is already merged.
+    AlreadyMerged = 101,
+    /// The duplicate is `Completed` (settled); merging would be lossy.
+    DuplicateSettled = 102,
+
+    // ── Relay signer set (110+ range) ───────────────────────────────────────
+    /// Threshold is 0 or exceeds the number of signers.
+    InvalidThreshold = 110,
+    /// Signer is already a member of the set.
+    SignerAlreadyExists = 111,
+    /// Signer is not a member of the set.
+    SignerNotFound = 112,
+    /// Fewer than `threshold` distinct signers authorised the call.
+    QuorumNotMet = 113,
+
+    // ── Relay signer timelock (120+ range) ──────────────────────────────────
+    /// `finalize_relay_signer` / `cancel_relay_signer_change` with nothing pending.
+    NoPendingRelaySigner = 120,
+    /// `finalize_relay_signer` called before the delay elapsed.
+    TimelockNotElapsed = 121,
+    /// A non-zero timelock delay is configured; use propose/finalize.
+    TimelockRequired = 122,
 }

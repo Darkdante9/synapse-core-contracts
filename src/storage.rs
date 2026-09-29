@@ -15,7 +15,8 @@
 use soroban_sdk::{Address, Env, String, Vec};
 
 use crate::types::{
-    DEFAULT_AMOUNT_CEILING, ContractError, StorageKey, Transaction, TransactionStatus, TransitionRecord, MAX_HISTORY_LEN,
+    DEFAULT_AMOUNT_CEILING, ContractError, PendingRelaySigner, RelaySignerSet, StorageKey, Transaction,
+    TransactionStatus, TransitionRecord, MAX_HISTORY_LEN,
 };
 
 /// TTL extension in ledgers applied to idempotency keys (~24 hours at ~5s/ledger).
@@ -79,18 +80,110 @@ impl StorageClient {
     // ── Relay signer ──────────────────────────────────────────────────────────
 
     /// Read the trusted relay signer address.
+    ///
+    /// With an N-of-M set this is the primary (first) signer.
     pub fn get_relay_signer(env: &Env) -> Result<Address, ContractError> {
-        env.storage()
-            .persistent()
-            .get(&StorageKey::RelaySigner)
+        Self::get_relay_signer_set(env)?
+            .signers
+            .get(0)
             .ok_or(ContractError::NotInitialised)
     }
 
-    /// Persist the relay signer address.
+    /// Persist the relay signer address (replaces the primary signer when a
+    /// signer set exists).
     pub fn set_relay_signer(env: &Env, signer: &Address) {
         env.storage()
             .persistent()
             .set(&StorageKey::RelaySigner, signer);
+        if let Some(mut set) = Self::get_relay_signer_set_opt(env) {
+            set.signers.set(0, signer.clone());
+            Self::set_relay_signer_set(env, &set);
+        }
+    }
+
+    fn get_relay_signer_set_opt(env: &Env) -> Option<RelaySignerSet> {
+        env.storage().persistent().get(&StorageKey::RelaySignerSet)
+    }
+
+    /// Read the relay signer set. Pre-N-of-M deployments migrate lazily:
+    /// the legacy single `RelaySigner` becomes `threshold = 1, signers = [it]`.
+    pub fn get_relay_signer_set(env: &Env) -> Result<RelaySignerSet, ContractError> {
+        if let Some(set) = Self::get_relay_signer_set_opt(env) {
+            return Ok(set);
+        }
+        let legacy: Address = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::RelaySigner)
+            .ok_or(ContractError::NotInitialised)?;
+        Ok(RelaySignerSet {
+            signers: soroban_sdk::vec![env, legacy],
+            threshold: 1,
+        })
+    }
+
+    /// Persist the relay signer set.
+    pub fn set_relay_signer_set(env: &Env, set: &RelaySignerSet) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::RelaySignerSet, set);
+    }
+
+    /// Record a signer's approval at the current ledger.
+    pub fn set_relay_approval(env: &Env, signer: &Address) {
+        env.storage().temporary().set(
+            &StorageKey::RelayApproval(signer.clone()),
+            &env.ledger().sequence(),
+        );
+    }
+
+    /// Ledger at which `signer` last approved, if any.
+    pub fn get_relay_approval(env: &Env, signer: &Address) -> Option<u32> {
+        env.storage()
+            .temporary()
+            .get(&StorageKey::RelayApproval(signer.clone()))
+    }
+
+    /// Consume (remove) `signer`'s approval.
+    pub fn clear_relay_approval(env: &Env, signer: &Address) {
+        env.storage()
+            .temporary()
+            .remove(&StorageKey::RelayApproval(signer.clone()));
+    }
+
+    // ── Relay signer timelock ─────────────────────────────────────────────────
+
+    /// Read the pending relay-signer change, if any.
+    pub fn get_pending_relay_signer(env: &Env) -> Option<PendingRelaySigner> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::PendingRelaySigner)
+    }
+
+    /// Persist (overwriting any existing) pending relay-signer change.
+    pub fn set_pending_relay_signer(env: &Env, p: &PendingRelaySigner) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::PendingRelaySigner, p);
+    }
+
+    /// Clear the pending relay-signer change.
+    pub fn clear_pending_relay_signer(env: &Env) {
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::PendingRelaySigner);
+    }
+
+    /// Timelock delay in ledgers; defaults to the ~24h constant.
+    pub fn get_relay_signer_delay(env: &Env) -> Option<u32> {
+        env.storage().persistent().get(&StorageKey::RelaySignerDelay)
+    }
+
+    /// Persist the timelock delay in ledgers.
+    pub fn set_relay_signer_delay(env: &Env, delay: u32) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::RelaySignerDelay, &delay);
     }
 
     // ── Admin transfer (two-step) ─────────────────────────────────────────────
@@ -189,6 +282,21 @@ impl StorageClient {
         );
     }
 
+    // ── Merge markers ─────────────────────────────────────────────────────────
+
+    /// Return the canonical tx id `tx_id` was merged into, if any.
+    pub fn get_merged_into(env: &Env, tx_id: &String) -> Option<String> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::MergedInto(tx_id.clone()))
+    }
+
+    /// Persist the `MergedInto(canonical)` marker for `duplicate`.
+    pub fn set_merged_into(env: &Env, duplicate: &String, canonical: &String) {
+        let key = StorageKey::MergedInto(duplicate.clone());
+        env.storage().persistent().set(&key, canonical);
+    }
+
     // ── Transaction history ───────────────────────────────────────────────────
 
     /// Append a transition record to the transaction's history (persistent).
@@ -211,11 +319,30 @@ impl StorageClient {
             timestamp: env.ledger().timestamp(),
         });
         env.storage().persistent().set(&key, &h);
+    }
         env.storage().persistent().extend_ttl(
             &key,
             TRANSACTION_MIN_TTL_LEDGERS,
             TRANSACTION_MIN_TTL_LEDGERS,
         );
+    }
+
+    // ── Forwarding routes ─────────────────────────────────────────────────────
+
+    /// Return the configured `next_phase` for `tx_id`, if any.
+    pub fn get_forward_route(env: &Env, tx_id: &String) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ForwardRoute(tx_id.clone()))
+    }
+
+    /// Set (`Some`) or clear (`None`) the forwarding route for `tx_id`.
+    pub fn set_forward_route(env: &Env, tx_id: &String, next_phase: Option<u32>) {
+        let key = StorageKey::ForwardRoute(tx_id.clone());
+        match next_phase {
+            Some(p) => env.storage().persistent().set(&key, &p),
+            None => env.storage().persistent().remove(&key),
+        }
     }
 
     /// Read a transaction's history, oldest first (empty if none recorded).
