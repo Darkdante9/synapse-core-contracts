@@ -33,6 +33,7 @@ three-phase lifecycle that ultimately bridges fiat deposits to cross-chain asset
 ```
 Pending ──► Processing ──► Completed
         └──────────────► Failed
+        └──────────────► Cancelled   (cancel_transaction; from Pending/Processing)
 ```
 
 | Transition              | Caller            | Entry-point              |
@@ -41,6 +42,7 @@ Pending ──► Processing ──► Completed
 | `Pending → Processing`  | relay or admin    | `start_processing()`     |
 | `Processing → Completed`| relay or admin    | `complete_transaction()` |
 | `* → Failed`            | relay or admin    | `fail_transaction()`     |
+| `Pending/Processing → Cancelled` | relay or admin | `cancel_transaction()` |
 
 ---
 
@@ -251,3 +253,10 @@ PR review or release cadence.
 Live emitters today: `init`, `reg`, `status`, `done`, `fail`, `propose`,
 `admin`, `relay`, `pause`, `upgrade` — the full catalogue in `EVENTS.md` is
 wired.
+
+## Handsoff notes
+
+<!-- handsoff-issue-92 -->
+- #92: [High] Add upgrade-simulation testnet tooling replaying mainnet storage snapshots
+<!-- handsoff-issue-102 -->
+- #102: [High] Add a cold-storage export entry point for pre-eviction off-chain archival
