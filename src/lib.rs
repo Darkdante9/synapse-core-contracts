@@ -35,7 +35,8 @@ mod validation;
 #[cfg(test)]
 mod test_pause;
 #[cfg(test)]
-mod test_recovery;
+    AdminRateLimitConfig, CallbackPayload, ContractError, PendingRelaySigner, RelaySignerSet,
+    RoleScope, Transaction, TransactionStatus, UnpauseRoles, MAX_BATCH_SIZE, SCHEMA_VERSION,
 #[cfg(test)]
 mod tests;
 
@@ -45,7 +46,8 @@ use crate::admin::AdminClient;
 use crate::events::EventEmitter;
 use crate::storage::StorageClient;
 use crate::types::{
-    CallbackPayload, ContractError, PendingRelaySigner, RelaySignerSet, RoleScope, Transaction, TransactionStatus, MAX_BATCH_SIZE, MAX_PAGE_LIMIT, MAX_RETRIES, DEFAULT_RELAY_SIGNER_DELAY_LEDGERS, SCHEMA_VERSION,
+    AdminRateLimitConfig, CallbackPayload, ContractError, PendingRelaySigner, RelaySignerSet, RoleScope, Transaction, TransactionStatus,
+    UnpauseRoles, MAX_BATCH_SIZE, MAX_PAGE_LIMIT, MAX_RETRIES, DEFAULT_RELAY_SIGNER_DELAY_LEDGERS, SCHEMA_VERSION,
 };
 use crate::validation::Validator;
 
@@ -830,7 +832,7 @@ impl SynapseCoreContract {
     /// # Events
     /// Emits [`events::EventAdminTransferProposed`].
     pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
-        let current_admin = AdminClient::require_admin(&env)?;
+        let current_admin = AdminClient::require_admin_rate_limited(&env)?;
         Validator::validate_admin_nominee(&env, &new_admin)?;
         StorageClient::set_pending_admin(&env, &new_admin);
         StorageClient::set_pending_admin_expiry(&env, None);
@@ -876,6 +878,11 @@ impl SynapseCoreContract {
     /// `caller` must be the pending nominee; the call requires `caller`'s own
     /// auth, which is what proves key control and finalises the transfer.
     ///
+    /// After a successful accept the nominee is the **live** admin. That live
+    /// successor is what [`Self::renounce_admin`] requires before the *former*
+    /// admin seat can be permanently vacated — see that method and
+    /// THREAT_MODEL.md R-02.
+    ///
     /// # Errors
     /// - [`ContractError::NoPendingAdminTransfer`] if no transfer is pending.
     /// - [`ContractError::Unauthorised`] if `caller` is not the pending nominee.
@@ -899,8 +906,58 @@ impl SynapseCoreContract {
 
         let old_admin = StorageClient::get_admin(&env)?;
         StorageClient::set_admin(&env, &caller);
+        StorageClient::set_previous_admin(&env, &old_admin);
         StorageClient::clear_pending_admin(&env);
         EventEmitter::admin_transferred(&env, &old_admin, &caller);
+        Ok(())
+    }
+
+    /// Permanently acknowledge step-down after a live successor has already
+    /// accepted (#76).
+    ///
+    /// ## Safety by construction (THREAT_MODEL.md R-02)
+    ///
+    /// Unlike OpenZeppelin `Ownable.renounceOwnership`, this entry point
+    /// **cannot** leave the contract with zero admin. It succeeds only when:
+    ///
+    /// 1. A successor has already completed [`Self::accept_admin`] and is the
+    ///    live [`StorageKey::Admin`], AND
+    /// 2. `caller` is the **outgoing** admin recorded at that accept
+    ///    ([`StorageKey::PreviousAdmin`]).
+    ///
+    /// Call sequence:
+    /// `propose_admin(successor)` → `accept_admin(successor)` (successor is
+    /// live, previous admin stored) → `renounce_admin(previous)`.
+    ///
+    /// Calling `renounce_admin` as the live admin (no distinct accepted
+    /// successor) returns [`ContractError::NoAcceptedSuccessor`] — the
+    /// void-renounce footgun is structurally unreachable. The sole way to
+    /// move the admin seat remains propose + accept.
+    ///
+    /// # Errors
+    /// - [`ContractError::NoAcceptedSuccessor`] if no prior `accept_admin`
+    ///   recorded an outgoing admin / live successor.
+    /// - [`ContractError::Unauthorised`] if `caller` is not that outgoing admin.
+    ///
+    /// # Events
+    /// Emits [`events::EventAdminRenounced`] on success.
+    pub fn renounce_admin(env: Env, caller: Address) -> Result<(), ContractError> {
+        // Exempt from rate limiting — succession must stay reachable.
+        caller.require_auth();
+        let live_admin = StorageClient::get_admin(&env)?;
+        let previous =
+            StorageClient::get_previous_admin(&env).ok_or(ContractError::NoAcceptedSuccessor)?;
+
+        // Live admin trying to burn the only seat → reject (void renounce).
+        if caller == live_admin {
+            return Err(ContractError::NoAcceptedSuccessor);
+        }
+        if caller != previous {
+            return Err(ContractError::Unauthorised);
+        }
+
+        StorageClient::clear_previous_admin(&env);
+        EventEmitter::admin_renounced(&env, &caller, &live_admin);
         Ok(())
     }
 
@@ -956,7 +1013,7 @@ impl SynapseCoreContract {
     /// Emits [`events::EventRelaySignerRotated`] so off-chain monitoring can
     /// observe the rotation the same way it does [`Self::accept_admin`].
     pub fn set_relay_signer(env: Env, new_signer: Address) -> Result<(), ContractError> {
-        AdminClient::require_admin(&env)?;
+        AdminClient::require_admin_rate_limited(&env)?;
         // Once a timelock delay is explicitly configured, the immediate path
         // is closed; rotation must go through propose/finalize.
         if StorageClient::get_relay_signer_delay(&env).unwrap_or(0) > 0 {
@@ -966,6 +1023,174 @@ impl SynapseCoreContract {
         StorageClient::set_relay_signer(&env, &new_signer);
         EventEmitter::relay_signer_rotated(&env, &old_signer, &new_signer);
         Ok(())
+    }
+
+    // ── Admin rate limit (#75) ────────────────────────────────────────────────
+
+    /// Configure the fixed-window admin-action rate limit (#75).
+    ///
+    /// `max_per_window` privileged admin calls are allowed inside each
+    /// `window_ledgers`-long fixed ledger window. Exempt entry points are
+    /// listed in [`admin`](crate::admin). Disabled until first configured.
+    ///
+    /// Itself exempt from the limit so operators can always raise/clear it.
+    pub fn set_admin_rate_limit(
+        env: Env,
+        max_per_window: u32,
+        window_ledgers: u32,
+    ) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        AdminClient::set_rate_limit_config(&env, max_per_window, window_ledgers)?;
+        Ok(())
+    }
+
+    /// Return the current admin rate-limit config, if any.
+    pub fn admin_rate_limit(env: Env) -> Option<AdminRateLimitConfig> {
+        StorageClient::get_admin_rate_limit_config(&env)
+    }
+
+    // ── Signer attestation (#77) ──────────────────────────────────────────────
+
+    /// Register a self-reported build/commit fingerprint for the relay signer
+    /// (#77).
+    ///
+    /// **Self-service by the current relay signer** (not admin-set): the
+    /// running off-chain service is the party that knows which binary it
+    /// launched. An admin-set path would let a compromised admin forge a
+    /// reassuring fingerprint. This value is a **visibility signal only** —
+    /// it is not cryptographically verified against a build artifact on-chain.
+    ///
+    /// Emits [`events::EventSignerAttestationSet`] on every call, including
+    /// no-op updates to the same hash, so monitors cannot be fooled by a
+    /// silent refresh masking a real rotation.
+    pub fn set_signer_attestation(
+        env: Env,
+        build_hash: BytesN<32>,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        let relay = StorageClient::get_relay_signer(&env)?;
+        if caller != relay {
+            return Err(ContractError::NotRelaySigner);
+        }
+        caller.require_auth();
+        // Reject the all-zero hash as "empty" so callers cannot accidentally
+        // clear the signal without intent.
+        if build_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(ContractError::EmptyAttestation);
+        }
+        StorageClient::set_signer_attestation(&env, &caller, &build_hash);
+        EventEmitter::signer_attestation_set(&env, &caller, &build_hash);
+        Ok(())
+    }
+
+    /// Read the self-reported build fingerprint for `signer`, if any (#77).
+    pub fn get_signer_attestation(env: Env, signer: Address) -> Option<BytesN<32>> {
+        StorageClient::get_signer_attestation(&env, &signer)
+    }
+
+    // ── Guardian + multi-role auto-unpause (#78) ──────────────────────────────
+
+    /// Set or rotate the guardian address (#78 dependency stub).
+    ///
+    /// The guardian is one of three voters in the automatic-pause 2-of-3
+    /// unpause policy. Manual `pause`/`unpause` remain admin-only.
+    pub fn set_guardian(env: Env, guardian: Address) -> Result<(), ContractError> {
+        AdminClient::require_admin_rate_limited(&env)?;
+        StorageClient::set_guardian(&env, &guardian);
+        EventEmitter::guardian_set(&env, &guardian);
+        Ok(())
+    }
+
+    /// Return the configured guardian, if any.
+    pub fn guardian(env: Env) -> Option<Address> {
+        StorageClient::get_guardian(&env)
+    }
+
+    /// Engage an **automatic** circuit-breaker pause (#78 dependency stub).
+    ///
+    /// Callable by admin or relay signer. Marks the pause as automatic so
+    /// recovery must go through [`Self::unpause_auto`] (2-of-3), not the
+    /// admin-only [`Self::unpause`]. Manual [`Self::pause`] remains separate.
+    pub fn trip_auto_pause(env: Env, caller: Address) -> Result<(), ContractError> {
+        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
+        StorageClient::set_paused(&env, true);
+        StorageClient::set_auto_paused(&env, true);
+        StorageClient::clear_auto_unpause_votes(&env);
+        EventEmitter::auto_paused(&env);
+        Ok(())
+    }
+
+    /// Cast one role's vote toward releasing an automatic pause (#78).
+    ///
+    /// Policy: **any 2 of {admin, guardian, relay-signer}**. Manual pauses
+    /// continue to use admin-only [`Self::unpause`] — that asymmetry is
+    /// intentional: auto-trips may be caused by a compromised admin, so
+    /// recovery must not single-point back onto that same key.
+    ///
+    /// Exactly one role auth is required per call; votes accumulate across
+    /// successful invocations. A single-role vote returns `Ok(())` but leaves
+    /// the pause engaged (Soroban reverts storage on `Err`, so incomplete
+    /// quorum cannot be signalled as an error without losing the vote).
+    /// Callers should check [`Self::is_paused`] / [`Self::is_auto_paused`]
+    /// after voting. When any pairwise quorum is reached the pause clears and
+    /// [`events::EventAutoUnpaused`] fires with the winning pair.
+    ///
+    /// # Errors
+    /// - [`ContractError::NotAutoPaused`] if no automatic pause is active.
+    /// - [`ContractError::Unauthorised`] / [`ContractError::GuardianNotSet`]
+    ///   for wrong callers.
+    pub fn unpause_auto(env: Env, caller: Address) -> Result<(), ContractError> {
+        if !StorageClient::is_paused(&env) || !StorageClient::is_auto_paused(&env) {
+            return Err(ContractError::NotAutoPaused);
+        }
+
+        let admin = StorageClient::get_admin(&env)?;
+        let relay = StorageClient::get_relay_signer(&env)?;
+        let guardian = StorageClient::get_guardian(&env);
+
+        let mut votes = StorageClient::get_auto_unpause_votes(&env);
+
+        if caller == admin {
+            caller.require_auth();
+            votes.admin_ok = true;
+        } else if caller == relay {
+            caller.require_auth();
+            votes.relay_ok = true;
+        } else if let Some(ref g) = guardian {
+            if caller == *g {
+                caller.require_auth();
+                votes.guardian_ok = true;
+            } else {
+                return Err(ContractError::Unauthorised);
+            }
+        } else {
+            return Err(ContractError::Unauthorised);
+        }
+
+        StorageClient::set_auto_unpause_votes(&env, &votes);
+
+        let roles = match (votes.admin_ok, votes.guardian_ok, votes.relay_ok) {
+            (true, true, _) => Some(UnpauseRoles::AdminGuardian),
+            (true, false, true) => Some(UnpauseRoles::AdminRelay),
+            (false, true, true) => Some(UnpauseRoles::GuardianRelay),
+            _ => None,
+        };
+
+        let Some(roles) = roles else {
+            // Vote recorded; pause remains. Returning Ok so the write commits.
+            return Ok(());
+        };
+
+        StorageClient::set_paused(&env, false);
+        StorageClient::set_auto_paused(&env, false);
+        StorageClient::clear_auto_unpause_votes(&env);
+        EventEmitter::auto_unpaused(&env, roles);
+        Ok(())
+    }
+
+    /// Return whether the current pause (if any) was an automatic trip.
+    pub fn is_auto_paused(env: Env) -> bool {
+        StorageClient::is_auto_paused(&env)
     }
 
     // ── Relay-signer liveness ─────────────────────────────────────────────────
@@ -1284,7 +1509,7 @@ impl SynapseCoreContract {
         new_wasm_hash: BytesN<32>,
         expected_schema_version: u32,
     ) -> Result<(), ContractError> {
-        let admin = AdminClient::require_admin(&env)?;
+        let admin = AdminClient::require_admin_rate_limited(&env)?;
         let schema_version = StorageClient::get_schema_version(&env)?;
         if schema_version != expected_schema_version {
             return Err(ContractError::SchemaVersionMismatch);
@@ -1305,9 +1530,14 @@ impl SynapseCoreContract {
     /// **deliberately left running** so already-registered work can drain during
     /// an incident, and all read-only queries stay available. Idempotent: pausing
     /// an already-paused contract is a no-op success.
+    ///
+    /// Manual pauses are released by admin-only [`Self::unpause`]. Automatic
+    /// trips use [`Self::trip_auto_pause`] / [`Self::unpause_auto`] instead.
     pub fn pause(env: Env) -> Result<(), ContractError> {
-        let admin = AdminClient::require_admin(&env)?;
+        let admin = AdminClient::require_admin_rate_limited(&env)?;
         StorageClient::set_paused(&env, true);
+        StorageClient::set_auto_paused(&env, false);
+        StorageClient::clear_auto_unpause_votes(&env);
         EventEmitter::pause_toggled(&env, true, &admin);
         Ok(())
     }
@@ -1399,10 +1629,30 @@ impl SynapseCoreContract {
         Ok(())
     }
 
-    /// Release the emergency circuit breaker, resuming normal callback
-    /// ingestion.  Admin-gated. Idempotent.
+    /// Release a **manual** emergency circuit breaker, resuming normal callback
+    /// ingestion. Admin-gated. Idempotent. Exempt from admin rate limiting so
+    /// recovery cannot be locked out (#75).
+    ///
+    /// If the pause was an automatic trip, returns
+    /// [`ContractError::RequiresMultiRoleUnpause`] — use [`Self::unpause_auto`].
     pub fn unpause(env: Env) -> Result<(), ContractError> {
+        // Exempt from rate limiting — recovery must stay reachable.
         let admin = AdminClient::require_admin(&env)?;
+        if StorageClient::is_auto_paused(&env) {
+            return Err(ContractError::RequiresMultiRoleUnpause);
+        }
+        StorageClient::set_paused(&env, false);
+        EventEmitter::pause_toggled(&env, false, &admin);
+        Ok(())
+    }
+
+    /// Return whether the emergency pause is currently engaged
+    pub fn unpause(env: Env) -> Result<(), ContractError> {
+        // Exempt from rate limiting — recovery must stay reachable.
+        let admin = AdminClient::require_admin(&env)?;
+        if StorageClient::is_auto_paused(&env) {
+            return Err(ContractError::RequiresMultiRoleUnpause);
+        }
         StorageClient::set_paused(&env, false);
         EventEmitter::pause_toggled(&env, false, &admin);
         Ok(())

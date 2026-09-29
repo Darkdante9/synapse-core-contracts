@@ -284,6 +284,25 @@ impl StorageClient {
         }
     }
 
+    /// Read the outgoing admin recorded at the last successful `accept_admin`.
+    pub fn get_previous_admin(env: &Env) -> Option<Address> {
+        env.storage().persistent().get(&StorageKey::PreviousAdmin)
+    }
+
+    /// Persist the outgoing admin so they may later call `renounce_admin`.
+    pub fn set_previous_admin(env: &Env, previous: &Address) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::PreviousAdmin, previous);
+    }
+
+    /// Clear the outgoing-admin marker after a successful renounce.
+    pub fn clear_previous_admin(env: &Env) {
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::PreviousAdmin);
+    }
+
     // ── Schema version ────────────────────────────────────────────────────────
 
     /// Read the on-chain storage schema version.
@@ -299,6 +318,109 @@ impl StorageClient {
         env.storage()
             .persistent()
             .set(&StorageKey::SchemaVersion, &version);
+    }
+
+    // ── Guardian (#78) ────────────────────────────────────────────────────────
+
+    /// Read the guardian address, if configured.
+    pub fn get_guardian(env: &Env) -> Option<Address> {
+        env.storage().persistent().get(&StorageKey::Guardian)
+    }
+
+    /// Persist the guardian address.
+    pub fn set_guardian(env: &Env, guardian: &Address) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Guardian, guardian);
+    }
+
+    // ── Auto-pause origin (#78) ───────────────────────────────────────────────
+
+    /// Returns `true` when the current pause was engaged by an automatic trip.
+    pub fn is_auto_paused(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&StorageKey::AutoPaused)
+            .unwrap_or(false)
+    }
+
+    /// Persist whether the current pause is automatic.
+    pub fn set_auto_paused(env: &Env, auto: bool) {
+        env.storage().instance().set(&StorageKey::AutoPaused, &auto);
+    }
+
+    // ── Auto-unpause votes (#78) ──────────────────────────────────────────────
+
+    /// Read accumulated auto-unpause role votes (defaults to empty).
+    pub fn get_auto_unpause_votes(env: &Env) -> crate::types::AutoUnpauseVotes {
+        env.storage()
+            .instance()
+            .get(&StorageKey::AutoUnpauseVotes)
+            .unwrap_or_else(crate::types::AutoUnpauseVotes::empty)
+    }
+
+    /// Persist auto-unpause role votes.
+    pub fn set_auto_unpause_votes(env: &Env, votes: &crate::types::AutoUnpauseVotes) {
+        env.storage()
+            .instance()
+            .set(&StorageKey::AutoUnpauseVotes, votes);
+    }
+
+    /// Clear auto-unpause votes after a successful unpause.
+    pub fn clear_auto_unpause_votes(env: &Env) {
+        env.storage()
+            .instance()
+            .remove(&StorageKey::AutoUnpauseVotes);
+    }
+
+    // ── Admin rate limit (#75) ────────────────────────────────────────────────
+
+    /// Read the admin rate-limit config, if configured.
+    pub fn get_admin_rate_limit_config(env: &Env) -> Option<crate::types::AdminRateLimitConfig> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::AdminRateLimitConfig)
+    }
+
+    /// Persist the admin rate-limit config.
+    pub fn set_admin_rate_limit_config(env: &Env, config: &crate::types::AdminRateLimitConfig) {
+        env.storage()
+            .instance()
+            .set(&StorageKey::AdminRateLimitConfig, config);
+    }
+
+    /// Read the admin rate-limit counter state.
+    pub fn get_admin_rate_limit_state(env: &Env) -> Option<crate::types::AdminRateLimitState> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::AdminRateLimitState)
+    }
+
+    /// Persist the admin rate-limit counter state.
+    pub fn set_admin_rate_limit_state(env: &Env, state: &crate::types::AdminRateLimitState) {
+        env.storage()
+            .instance()
+            .set(&StorageKey::AdminRateLimitState, state);
+    }
+
+    // ── Signer attestation (#77) ──────────────────────────────────────────────
+
+    /// Read a signer's self-reported build fingerprint, if any.
+    pub fn get_signer_attestation(env: &Env, signer: &Address) -> Option<soroban_sdk::BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::SignerAttestation(signer.clone()))
+    }
+
+    /// Persist a signer's self-reported build fingerprint.
+    pub fn set_signer_attestation(
+        env: &Env,
+        signer: &Address,
+        build_hash: &soroban_sdk::BytesN<32>,
+    ) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::SignerAttestation(signer.clone()), build_hash);
     }
 
     // ── Transactions ──────────────────────────────────────────────────────────

@@ -257,6 +257,46 @@ pub struct EventPauseToggled {
     pub ledger: u32,
 }
 
+/// Emitted when a relay signer updates its self-reported build fingerprint
+/// (#77). This is an operational signal, **not** a cryptographic proof that
+/// the off-chain binary matches the hash.
+#[contracttype]
+pub struct EventSignerAttestationSet {
+    pub signer: soroban_sdk::Address,
+    pub build_hash: soroban_sdk::BytesN<32>,
+    pub ledger: u32,
+}
+
+/// Emitted when the current admin permanently steps down in favour of a
+/// live, already-accepted successor (#76).
+#[contracttype]
+pub struct EventAdminRenounced {
+    pub former_admin: soroban_sdk::Address,
+    pub successor: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
+/// Emitted when an automatic pause is released via the 2-of-3 multi-role
+/// path (#78). Distinguishes which role pair completed the quorum.
+#[contracttype]
+pub struct EventAutoUnpaused {
+    pub roles: crate::types::UnpauseRoles,
+    pub ledger: u32,
+}
+
+/// Emitted when the guardian address is set or rotated (#78 stub dependency).
+#[contracttype]
+pub struct EventGuardianSet {
+    pub guardian: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
+/// Emitted when an automatic circuit-breaker pause is engaged (#78).
+#[contracttype]
+pub struct EventAutoPaused {
+    pub ledger: u32,
+}
+
 /// Emitted by [`SynapseCoreContract::merge_duplicate_transactions`] when an
 /// admin links a duplicate record to its canonical original (break-glass).
 #[contracttype]
@@ -616,6 +656,22 @@ impl EventEmitter {
         );
     }
 
+    /// Emit [`EventSignerAttestationSet`].
+    pub fn signer_attestation_set(
+        env: &Env,
+        signer: &soroban_sdk::Address,
+        build_hash: &soroban_sdk::BytesN<32>,
+    ) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("attest")),
+            EventSignerAttestationSet {
+                signer: signer.clone(),
+                build_hash: build_hash.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
     /// Emit [`EventHeartbeat`].
     pub fn heartbeat(env: &Env, signer: &soroban_sdk::Address) {
         env.events().publish(
@@ -623,22 +679,6 @@ impl EventEmitter {
             EventHeartbeat {
                 signer: signer.clone(),
                 timestamp: env.ledger().timestamp(),
-            },
-        );
-    }
-
-    /// Emit [`EventTransactionExpired`].
-    pub fn transaction_expired(env: &Env, tx_id: &String, registered_at: u64) {
-        env.events().publish(
-            (symbol_short!("synapse"), symbol_short!("expired")),
-            EventTransactionExpired {
-                tx_id: tx_id.clone(),
-                registered_at,
-                expired_at: env.ledger().timestamp(),
-                ledger: env.ledger().sequence(),
-            },
-        );
-    }
             },
         );
     }
@@ -701,6 +741,48 @@ impl EventEmitter {
             },
         );
     }
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventAdminRenounced`].
+    pub fn admin_renounced(
+        env: &Env,
+        former_admin: &soroban_sdk::Address,
+        successor: &soroban_sdk::Address,
+    ) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("renounce")),
+            EventAdminRenounced {
+                former_admin: former_admin.clone(),
+                successor: successor.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventAutoUnpaused`].
+    pub fn auto_unpaused(env: &Env, roles: crate::types::UnpauseRoles) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("aunpause")),
+            EventAutoUnpaused {
+                roles,
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventGuardianSet`].
+    pub fn guardian_set(env: &Env, guardian: &soroban_sdk::Address) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("guardian")),
+            EventGuardianSet {
+                guardian: guardian.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
 
     /// Emit [`EventGuardianPaused`].
     pub fn guardian_paused(env: &Env, guardian: &soroban_sdk::Address) {
@@ -713,7 +795,35 @@ impl EventEmitter {
         );
     }
 
-    /// Emit [`EventAdminRevokedEmerge
+
+                guardian: guardian.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventGuardianPaused`].
+    pub fn guardian_paused(env: &Env, guardian: &soroban_sdk::Address) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("gpause")),
+            EventGuardianPaused {
+                guardian: guardian.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventAdminRevokedEmergency`].
+    pub fn admin_revoked_emergency(
+        env: &Env,
+        revoked_admin: &soroban_sdk::Address,
+        approvals: u32,
+    ) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("adm_rev")),
+            EventAdminRevokedEmergency {
+                revoked_admin: revoked_admin.clone(),
+                approvals,
                 ledger: env.ledger().sequence(),
             },
         );
@@ -761,32 +871,11 @@ impl EventEmitter {
         );
     }
 
-    /// Emit [`EventGuardianPaused`].
-    pub fn guardian_paused(env: &Env, guardian: &soroban_sdk::Address) {
+    /// Emit [`EventAutoPaused`].
+    pub fn auto_paused(env: &Env) {
         env.events().publish(
-            (symbol_short!("synapse"), symbol_short!("gpause")),
-            EventGuardianPaused {
-                guardian: guardian.clone(),
-                ledger: env.ledger().sequence(),
-            },
-        );
-    }
-
-    /// Emit [`EventAdminRevokedEmergency`].
-    pub fn admin_revoked_emergency(
-        env: &Env,
-        revoked_admin: &soroban_sdk::Address,
-        approvals: u32,
-    ) {
-        env.events().publish(
-            (symbol_short!("synapse"), symbol_short!("adm_rev")),
-            EventAdminRevokedEmergency {
-                revoked_admin: revoked_admin.clone(),
-                approvals,
-                ledger: env.ledger().sequence(),
-            },
-        );
-    }
+            (symbol_short!("synapse"), symbol_short!("apause")),
+            EventAutoPaused {
                 ledger: env.ledger().sequence(),
             },
         );
