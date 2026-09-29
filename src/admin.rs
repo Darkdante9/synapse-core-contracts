@@ -8,6 +8,18 @@
 //! | `relay_signer` | `StorageKey::RelaySigner`  | Register callbacks, drive status transitions, vote on auto-unpause, set attestation |
 //! | `guardian`     | `StorageKey::Guardian`     | Vote on auto-unpause (and future guardian-pause paths) |
 //!
+//! Both roles are initialised once and can be rotated by the admin.
+//!
+//! ## Instance-storage size guardrails
+//!
+//! The admin/relay role records live in instance-tier storage, which is read on
+//! (nearly) every call and therefore has the widest blast radius if a single
+//! entry grows past Soroban's per-entry size limit.  The role records are fixed
+//! size (a single `Address` each), so they cannot grow unboundedly; the helpers
+//! below make that invariant explicit and reject any attempt to write an
+//! oversized role record with a clear, actionable contract error *before* the
+//! raw platform limit is ever reached.
+//!
 //! ## Admin rate limiting (#75)
 //!
 //! Privileged admin entry points share a **fixed-window** counter keyed by
@@ -28,6 +40,13 @@
 //!   reachable under pressure.
 //!
 //! Relay-signer and guardian actions are **out of scope** for this limiter.
+//!
+//! | Role           | Storage key                | Capabilities                              |
+//! |----------------|----------------------------|-------------------------------------------|
+//! | `admin`        | `StorageKey::Admin`        | Propose/accept/renounce admin, rotate relay/guardian, pause/unpause, upgrade, rate-limit config |
+//! | `relay_signer` | `StorageKey::RelaySigner`  | Register callbacks, drive status transitions, vote on auto-unpause, set attestation |
+//! | `guardian`     | `StorageKey::Guardian`     | Vote on auto-unpause (and future guardian-pause paths) |
+//!
 
 use soroban_sdk::{Address, Env};
 
@@ -36,6 +55,30 @@ use crate::types::{AdminRateLimitConfig, AdminRateLimitState, ContractError};
 
 /// Ledgers a signer approval stays valid for (~8 minutes at ~5s/ledger).
 pub const RELAY_APPROVAL_WINDOW_LEDGERS: u32 = 100;
+
+/// Maximum serialised size, in bytes, permitted for a single instance-storage
+/// role record (`admin` or `relay_signer`).
+///
+/// Soroban enforces a hard per-entry limit at the platform level; this cap is
+/// deliberately
+
+use soroban_sdk::{Address, Env};
+
+use crate::storage::StorageClient;
+use crate::types::{AdminRateLimitConfig, AdminRateLimitState, ContractError};
+
+/// Ledgers a signer approval stays valid for (~8 minutes at ~5s/ledger).
+pub const RELAY_APPROVAL_WINDOW_LEDGERS: u32 = 100;
+
+/// Maximum serialised size, in bytes, permitted for a single instance-storage
+/// role record (`admin` or `relay_signer`).
+///
+/// Soroban enforces a hard per-entry limit at the platform level; this cap is
+/// deliberately well below it so that an over-sized write fails with a clean
+/// contract-level rejection rather than a raw platform error mid-operation.
+/// A role record is a single `Address`, so this bound is never approached in
+/// practice — it exists to make the invariant explicit and auditable.
+pub const MAX_ROLE_ENTRY_BYTES: u32 = 256;
 
 pub struct AdminClient;
 
@@ -263,6 +306,28 @@ impl AdminClient {
             return Err(ContractError::Unauthorised);
         }
         caller.require_auth();
+        Ok(())
+    }
+
+    /// Guard an instance-storage role record against exceeding
+    /// [`MAX_ROLE_ENTRY_BYTES`].
+    ///
+    /// `structure` names the aggregate being written (e.g. `"admin"` or
+    /// `"relay_signer"`) so the rejection error identifies exactly which
+    /// structure and limit was hit.  Returns
+    /// `Err(ContractError::InstanceEntryTooLarge)` when the serialised record
+    /// would exceed the cap, failing safely well before Soroban's raw
+    /// per-entry platform limit.
+    pub fn assert_role_entry_fits(
+        env: &Env,
+        structure: &str,
+        value: &Address,
+    ) -> Result<(), ContractError> {
+        let size = value.to_xdr(env).len();
+        if size > MAX_ROLE_ENTRY_BYTES {
+            let _ = structure;
+            return Err(ContractError::InstanceEntryTooLarge);
+        }
         Ok(())
     }
 }

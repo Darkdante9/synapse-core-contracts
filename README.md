@@ -253,3 +253,8 @@ PR review or release cadence.
 Live emitters today: `init`, `reg`, `status`, `done`, `fail`, `propose`,
 `admin`, `relay`, `pause`, `upgrade` — the full catalogue in `EVENTS.md` is
 wired.
+
+## Handsoff notes
+
+<!-- handsoff-issue-102 -->
+- #102: [High] Add a cold-storage export entry point for pre-eviction off-chain archival

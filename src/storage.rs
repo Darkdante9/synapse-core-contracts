@@ -11,6 +11,16 @@
 //! | Transactions          | `persistent` | Long-lived; needed for audit trail       |
 //! | Idempotency keys      | `temporary`  | 24-hour TTL; evicted by the ledger       |
 //! | Initialised flag      | `instance`   | Lives with the contract instance         |
+//!
+//! ## Temporary-tier read semantics
+//!
+//! Temporary entries are *not* restorable: once an idempotency key passes its
+//! TTL the ledger simply drops it, and a subsequent read returns `None` rather
+//! than triggering a restoration panic. Every temporary-tier read site in this
+//! module therefore treats absence as a well-defined "key not found" business
+//! case (see [`StorageClient::get_idempotency_key`]) so callers such as
+//! `register_callback` fall through to their durable existing-record guard
+//! instead of surfacing an unhandled contract error.
 
 use soroban_sdk::{Address, Env, String, Vec};
 
@@ -730,6 +740,13 @@ impl StorageClient {
 
     /// Return the ledger sequence at which an idempotency key was first stored,
     /// or `None` if the key is unknown / expired.
+    ///
+    /// This is the sole temporary-tier read site in the contract. Temporary
+    /// entries are not restorable: once the key's TTL elapses the ledger evicts
+    /// it and this read yields `None` — it never triggers a restoration panic.
+    /// Callers must therefore treat `None` as the well-defined "key absent"
+    /// business case (e.g. `register_callback` falls through to its durable
+    /// `transaction_exists` guard) rather than assuming presence.
     pub fn get_idempotency_key(env: &Env, key: &String) -> Option<u32> {
         env.storage()
             .temporary()
