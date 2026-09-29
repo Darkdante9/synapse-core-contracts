@@ -203,6 +203,81 @@ impl StorageClient {
     /// Clear the pending admin nominee after a transfer is accepted.
     pub fn clear_pending_admin(env: &Env) {
         env.storage().persistent().remove(&StorageKey::PendingAdmin);
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::PendingAdminExpiry);
+    }
+
+    /// Next expected nonce for `addr` (0 if never used).
+    pub fn get_nonce(env: &Env, addr: &Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Nonce(addr.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Persist the next expected nonce for `addr`.
+    pub fn set_nonce(env: &Env, addr: &Address, next: u64) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Nonce(addr.clone()), &next);
+    }
+
+    /// Allowed anchor/issuer IDs for `signer`; empty means unrestricted.
+    pub fn get_relay_anchors(env: &Env, signer: &Address) -> Vec<String> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::RelayAnchors(signer.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    /// Replace the anchor allowlist for `signer`.
+    pub fn set_relay_anchors(env: &Env, signer: &Address, anchors: &Vec<String>) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::RelayAnchors(signer.clone()), anchors);
+    }
+
+    /// Read the pending relay-signer nominee.
+    pub fn get_pending_relay_signer(env: &Env) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::PendingRelaySigner)
+    }
+
+    /// Store (`Some`) or clear (`None`) the pending relay-signer nominee.
+    pub fn set_pending_relay_signer(env: &Env, nominee: Option<&Address>) {
+        match nominee {
+            Some(a) => env
+                .storage()
+                .persistent()
+                .set(&StorageKey::PendingRelaySigner, a),
+            None => env
+                .storage()
+                .persistent()
+                .remove(&StorageKey::PendingRelaySigner),
+        }
+    }
+
+    /// Read the optional expiry timestamp of the pending admin proposal.
+    pub fn get_pending_admin_expiry(env: &Env) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::PendingAdminExpiry)
+    }
+
+    /// Set (or clear, with `None`) the pending admin proposal expiry.
+    pub fn set_pending_admin_expiry(env: &Env, expiry: Option<u64>) {
+        match expiry {
+            Some(t) => env
+                .storage()
+                .persistent()
+                .set(&StorageKey::PendingAdminExpiry, &t),
+            None => env
+                .storage()
+                .persistent()
+                .remove(&StorageKey::PendingAdminExpiry),
+        }
     }
 
     // ── Schema version ────────────────────────────────────────────────────────

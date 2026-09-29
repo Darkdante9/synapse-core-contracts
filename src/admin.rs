@@ -29,6 +29,20 @@ impl AdminClient {
         Ok(admin)
     }
 
+    /// Check `nonce` against `addr`'s next expected nonce and increment it.
+    ///
+    /// Nonces are strictly sequential per address: only the exact next value
+    /// is accepted (no gaps, no reuse). Any other value fails with
+    /// [`ContractError::InvalidNonce`].
+    pub fn consume_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), ContractError> {
+        let expected = StorageClient::get_nonce(env, addr);
+        if nonce != expected {
+            return Err(ContractError::InvalidNonce);
+        }
+        StorageClient::set_nonce(env, addr, expected + 1);
+        Ok(())
+    }
+
     /// Assert that `caller` is either the admin or the trusted relay signer.
     ///
     /// Used by status-transition methods which are callable by both roles.

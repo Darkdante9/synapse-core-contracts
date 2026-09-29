@@ -174,6 +174,14 @@ pub struct EventAdminTransferProposed {
     pub ledger: u32,
 }
 
+/// Emitted by `propose_relay_signer` when a new relay signer is nominated.
+#[contracttype]
+pub struct EventRelaySignerProposed {
+    pub current_signer: soroban_sdk::Address,
+    pub proposed_signer: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
 /// Emitted when the trusted relay signer is rotated.
 ///
 /// Relay-signer compromise lets an attacker register forged callbacks and
@@ -340,6 +348,22 @@ impl EventEmitter {
             EventAdminTransferProposed {
                 current_admin: current_admin.clone(),
                 proposed_admin: proposed_admin.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventRelaySignerProposed`].
+    pub fn relay_signer_proposed(
+        env: &Env,
+        current_signer: &soroban_sdk::Address,
+        proposed_signer: &soroban_sdk::Address,
+    ) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("rsprop")),
+            EventRelaySignerProposed {
+                current_signer: current_signer.clone(),
+                proposed_signer: proposed_signer.clone(),
                 ledger: env.ledger().sequence(),
             },
         );

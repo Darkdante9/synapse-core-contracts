@@ -232,6 +232,12 @@ pub enum StorageKey {
     /// Singleton: on-chain storage schema version, set at `initialize()`.
     /// See [`SCHEMA_VERSION`].
     SchemaVersion,
+    /// Optional expiry (ledger timestamp, seconds) of the pending admin proposal.
+    PendingAdminExpiry,
+    /// Per-address replay-protection nonce (next expected value).
+    Nonce(Address),
+    /// Per-relay-signer allowlist of anchor instance IDs (empty/absent = all).
+    RelayAnchors(Address),
     /// Singleton: max age in seconds of a `Pending` transaction before it
     /// may be expired. Absent means expiry is disabled.
     ExpiryWindow,
@@ -359,7 +365,6 @@ pub enum ContractError {
     /// on-chain [`SchemaVersion`](StorageKey::SchemaVersion); the upgrade was
     /// aborted before touching contract WASM.
     SchemaVersionMismatch = 60,
-
     // ── Backpressure ────────────────────────────────────────────────────────
     /// Relay signer already has the maximum allowed outstanding `Pending` transactions.
     OutstandingCapExceeded = 70,
@@ -419,4 +424,12 @@ pub enum ContractError {
     TimelockNotElapsed = 121,
     /// A non-zero timelock delay is configured; use propose/finalize.
     TimelockRequired = 122,
+
+    // ── Admin proposal expiry (ADR-0002 amendment) ──────────────────────────
+    /// The pending admin proposal has passed its expiry timestamp.
+    AdminProposalExpired = 200,
+    /// A supplied nonce did not match the caller's next expected nonce.
+    InvalidNonce = 210,
+    /// The relay signer is not allowlisted for the payload's anchor instance ID.
+    AnchorNotAllowed = 220,
 }

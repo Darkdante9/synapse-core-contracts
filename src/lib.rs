@@ -117,6 +117,14 @@ impl SynapseCoreContract {
         // Only the trusted relay signer may forward Anchor Platform callbacks.
         AdminClient::require_relay_quorum(&env, None)?;
 
+        // Anchor allowlist: an empty allowlist means "all anchors" (backward
+        // compatible default, weaker; tighten post-deployment). The anchor
+        // identity is the payload's `asset_issuer`.
+        let allowed = StorageClient::get_relay_anchors(&env, &relay);
+        if !allowed.is_empty() && !allowed.contains(&payload.asset_issuer) {
+            return Err(ContractError::AnchorNotAllowed);
+        }
+
         Validator::validate_payload(&env, &payload)?;
 
         // Idempotency: a replayed key returns the original tx id without a
@@ -820,7 +828,41 @@ impl SynapseCoreContract {
         let current_admin = AdminClient::require_admin(&env)?;
         Validator::validate_admin_nominee(&env, &new_admin)?;
         StorageClient::set_pending_admin(&env, &new_admin);
+        StorageClient::set_pending_admin_expiry(&env, None);
         EventEmitter::admin_transfer_proposed(&env, &current_admin, &new_admin);
+        Ok(())
+    }
+
+    /// Like [`Self::propose_admin`] but the proposal is only acceptable up to
+    /// and including `expiry` (ledger timestamp, seconds).
+    ///
+    /// # Errors
+    /// - [`ContractError::AdminProposalExpired`] if `expiry` is already in the past.
+    pub fn propose_admin_with_expiry(
+        env: Env,
+        new_admin: Address,
+        expiry: u64,
+    ) -> Result<(), ContractError> {
+        if expiry < env.ledger().timestamp() {
+            return Err(ContractError::AdminProposalExpired);
+        }
+        Self::propose_admin(env.clone(), new_admin)?;
+        StorageClient::set_pending_admin_expiry(&env, Some(expiry));
+        Ok(())
+    }
+
+    /// Withdraw a pending admin proposal. Current-admin-only.
+    ///
+    /// # Errors
+    /// - [`ContractError::NoPendingAdminTransfer`] if nothing is pending
+    ///   (e.g. it was already accepted).
+    pub fn cancel_admin_proposal(env: Env, caller: Address) -> Result<(), ContractError> {
+        let admin = AdminClient::require_admin(&env)?;
+        if caller != admin {
+            return Err(ContractError::Unauthorised);
+        }
+        StorageClient::get_pending_admin(&env).ok_or(ContractError::NoPendingAdminTransfer)?;
+        StorageClient::clear_pending_admin(&env);
         Ok(())
     }
 
@@ -842,6 +884,13 @@ impl SynapseCoreContract {
             return Err(ContractError::Unauthorised);
         }
         caller.require_auth();
+
+        // Expiry is inclusive: accepting at exactly `expiry` still succeeds.
+        if let Some(expiry) = StorageClient::get_pending_admin_expiry(&env) {
+            if env.ledger().timestamp() > expiry {
+                return Err(ContractError::AdminProposalExpired);
+            }
+        }
 
         let old_admin = StorageClient::get_admin(&env)?;
         StorageClient::set_admin(&env, &caller);
@@ -914,6 +963,72 @@ impl SynapseCoreContract {
         Ok(())
     }
 
+    /// Set the anchor/issuer IDs `signer` may register callbacks for. Admin only.
+    ///
+    /// An empty list means unrestricted (all anchors) - the migration-friendly
+    /// default. Callbacks outside a non-empty list fail with
+    /// [`ContractError::AnchorNotAllowed`].
+    pub fn set_relay_anchors(
+        env: Env,
+        signer: Address,
+        anchors: Vec<String>,
+    ) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        StorageClient::set_relay_anchors(&env, &signer, &anchors);
+        Ok(())
+    }
+
+    /// Return the anchor allowlist for `signer` (empty = unrestricted).
+    pub fn relay_anchors(env: Env, signer: Address) -> Vec<String> {
+        StorageClient::get_relay_anchors(&env, &signer)
+    }
+
+    // ── Replay-protected (nonce) variants of privileged calls ────────────────
+
+    /// Return the next expected nonce for `addr` (0 if never used).
+    pub fn get_nonce(env: Env, addr: Address) -> u64 {
+        StorageClient::get_nonce(&env, &addr)
+    }
+
+    /// Nonce-checked [`Self::propose_admin`]. The admin's nonce must equal
+    /// [`Self::get_nonce`]; it is incremented on success. The plain variants
+    /// are retained for backward compatibility (see CHANGELOG).
+    pub fn propose_admin_with_nonce(
+        env: Env,
+        new_admin: Address,
+        nonce: u64,
+    ) -> Result<(), ContractError> {
+        let admin = AdminClient::require_admin(&env)?;
+        AdminClient::consume_nonce(&env, &admin, nonce)?;
+        Self::propose_admin(env, new_admin)
+    }
+
+    /// Nonce-checked [`Self::pause`].
+    pub fn pause_with_nonce(env: Env, nonce: u64) -> Result<(), ContractError> {
+        let admin = AdminClient::require_admin(&env)?;
+        AdminClient::consume_nonce(&env, &admin, nonce)?;
+        Self::pause(env)
+    }
+
+    /// Nonce-checked [`Self::unpause`].
+    pub fn unpause_with_nonce(env: Env, nonce: u64) -> Result<(), ContractError> {
+        let admin = AdminClient::require_admin(&env)?;
+        AdminClient::consume_nonce(&env, &admin, nonce)?;
+        Self::unpause(env)
+    }
+
+    /// Nonce-checked status transition start (`caller` is admin or relay).
+    pub fn start_processing_with_nonce(
+        env: Env,
+        tx_id: String,
+        caller: Address,
+        nonce: u64,
+    ) -> Result<(), ContractError> {
+        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
+        AdminClient::consume_nonce(&env, &caller, nonce)?;
+        Self::start_processing(env, tx_id, caller)
+    }
+
     // ── Timelocked relay-signer rotation ──────────────────────────────────────
 
     /// Configure the timelock delay (ledgers) for relay-signer rotation.
@@ -930,6 +1045,18 @@ impl SynapseCoreContract {
     /// (restarting the delay). With an N-of-M set (#65) only the primary
     /// signer slot is replaced; membership/threshold changes stay immediate
     /// admin operations.
+    ///
+    /// # Events
+    /// Emits [`events::EventRelaySignerProposed`].
+    pub fn propose_relay_signer(env: Env, new_signer: Address) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        let current = StorageClient::get_relay_signer(&env)?;
+        StorageClient::set_pending_relay_signer(&env, Some(&new_signer));
+        EventEmitter::relay_signer_proposed(&env, &current, &new_signer);
+        Ok(())
+    }
+
+    /// Complete a relay-signer rotation
     ///
     /// # Events
     /// Emits [`events::EventRelaySignerProposed`].
