@@ -268,6 +268,18 @@ pub enum StorageKey {
     PendingRelaySigner,
     /// Singleton: timelock delay in ledgers (absent = default).
     RelaySignerDelay,
+    /// Per-signer ledger timestamp of the last `heartbeat()` call.
+    LastHeartbeat(soroban_sdk::Address),
+    /// Singleton: staleness window in seconds; absent/0 disables quarantine.
+    HeartbeatWindow,
+    /// Per-address set of granted [`RoleScope`]s.
+    Scopes(soroban_sdk::Address),
+    /// Singleton: guardian address set (may `guardian_pause`).
+    Guardians,
+    /// Singleton: guardian quorum M required by `revoke_admin_emergency`.
+    GuardianThreshold,
+    /// Singleton: set once the admin was revoked via break-glass.
+    AdminVacant,
 }
 
 /// Pending timelocked relay-signer rotation, finalisable at `eta_ledger`.
@@ -288,6 +300,19 @@ pub const DEFAULT_RELAY_SIGNER_DELAY_LEDGERS: u32 = 17_280;
 pub struct RelaySignerSet {
     pub signers: Vec<Address>,
     pub threshold: u32,
+}
+
+/// Narrow processing-lifecycle permissions grantable independently of the
+/// relay signer. The relay signer and admin implicitly hold every scope.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoleScope {
+    /// May call `start_processing`.
+    StartProcessing,
+    /// May call `complete_transaction`.
+    CompleteTransaction,
+    /// May call `fail_transaction`.
+    FailTransaction,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -432,4 +457,16 @@ pub enum ContractError {
     InvalidNonce = 210,
     /// The relay signer is not allowlisted for the payload's anchor instance ID.
     AnchorNotAllowed = 220,
+
+    // ── Liveness / quarantine (300+) ────────────────────────────────────────
+    /// The relay signer's heartbeat is stale beyond the configured window;
+    /// new registrations are refused until it heartbeats or is cleared.
+    SignerQuarantined = 300,
+    /// Caller is not a guardian.
+    NotGuardian = 301,
+    /// Guardian quorum is not configured or was not met.
+    QuorumNotMetGuardian = 302,
+    /// The admin role is vacant (break-glass revocation); admin-gated
+    /// operations are unavailable.
+    AdminVacant = 303,
 }

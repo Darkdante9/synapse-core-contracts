@@ -45,7 +45,7 @@ use crate::admin::AdminClient;
 use crate::events::EventEmitter;
 use crate::storage::StorageClient;
 use crate::types::{
-    CallbackPayload, ContractError, PendingRelaySigner, RelaySignerSet, Transaction, TransactionStatus, MAX_BATCH_SIZE, MAX_PAGE_LIMIT, MAX_RETRIES, DEFAULT_RELAY_SIGNER_DELAY_LEDGERS, SCHEMA_VERSION,
+    CallbackPayload, ContractError, PendingRelaySigner, RelaySignerSet, RoleScope, Transaction, TransactionStatus, MAX_BATCH_SIZE, MAX_PAGE_LIMIT, MAX_RETRIES, DEFAULT_RELAY_SIGNER_DELAY_LEDGERS, SCHEMA_VERSION,
 };
 use crate::validation::Validator;
 
@@ -124,6 +124,10 @@ impl SynapseCoreContract {
         if !allowed.is_empty() && !allowed.contains(&payload.asset_issuer) {
             return Err(ContractError::AnchorNotAllowed);
         }
+
+        // Quarantine: a signer with a stale heartbeat cannot take new intake.
+        // Existing Pending/Processing work stays processable.
+        AdminClient::assert_not_quarantined(&env, &relay)?;
 
         Validator::validate_payload(&env, &payload)?;
 
@@ -255,7 +259,7 @@ impl SynapseCoreContract {
     /// Called by the relay when the off-chain processor picks up the job.
     /// Enforces the state machine: only `Pending → Processing` is valid here.
     pub fn start_processing(env: Env, tx_id: String, caller: Address) -> Result<(), ContractError> {
-        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
+        AdminClient::require_scope(&env, &caller, RoleScope::StartProcessing)?;
 
         let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
         if tx.status != TransactionStatus::Pending {
@@ -283,6 +287,7 @@ impl SynapseCoreContract {
         stellar_tx_hash: String,
         caller: Address,
     ) -> Result<(), ContractError> {
+        AdminClient::require_scope(&env, &caller, RoleScope::CompleteTransaction)?;
         Validator::validate_stellar_tx_hash(&stellar_tx_hash)?;
 
         let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
@@ -442,7 +447,7 @@ impl SynapseCoreContract {
         reason: String,
         caller: Address,
     ) -> Result<(), ContractError> {
-        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
+        AdminClient::require_scope(&env, &caller, RoleScope::FailTransaction)?;
         Validator::validate_failure_reason(&reason)?;
 
         let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
@@ -963,6 +968,75 @@ impl SynapseCoreContract {
         Ok(())
     }
 
+    // ── Relay-signer liveness ─────────────────────────────────────────────────
+
+    /// Record a liveness heartbeat for the relay signer `caller`.
+    ///
+    /// Only the registered relay signer may call this.
+    ///
+    /// # Events
+    /// Emits [`events::EventHeartbeat`].
+    pub fn heartbeat(env: Env, caller: Address) -> Result<(), ContractError> {
+        AdminClient::require_relay_signer(&env, &caller)?;
+        StorageClient::set_last_heartbeat(&env, &caller, env.ledger().timestamp());
+        EventEmitter::heartbeat(&env, &caller);
+        Ok(())
+    }
+
+    /// Set the heartbeat staleness window in seconds (`0` disables
+    /// quarantine). Admin-gated.
+    pub fn set_heartbeat_window(env: Env, secs: u64) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        StorageClient::set_heartbeat_window(&env, secs);
+        Ok(())
+    }
+
+    /// Manually lift a quarantine by resetting `signer`'s heartbeat to now.
+    /// Admin-gated.
+    ///
+    /// # Events
+    /// Emits [`events::EventQuarantineCleared`].
+    pub fn clear_quarantine(env: Env, signer: Address) -> Result<(), ContractError> {
+        let admin = AdminClient::require_admin(&env)?;
+        StorageClient::set_last_heartbeat(&env, &signer, env.ledger().timestamp());
+        EventEmitter::quarantine_cleared(&env, &signer, &admin);
+        Ok(())
+    }
+
+    /// Return whether `signer` is currently quarantined.
+    pub fn is_quarantined(env: Env, signer: Address) -> bool {
+        AdminClient::assert_not_quarantined(&env, &signer).is_err()
+    }
+
+    // ── Role scopes ─────────────────────────────────────────────────────────────
+
+    /// Grant `scope` to `who` (idempotent). Admin-gated.
+    pub fn grant_scope(env: Env, who: Address, scope: RoleScope) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        let mut scopes = StorageClient::get_scopes(&env, &who);
+        if !scopes.contains(scope) {
+            scopes.push_back(scope);
+            StorageClient::set_scopes(&env, &who, &scopes);
+        }
+        Ok(())
+    }
+
+    /// Revoke `scope` from `who` (idempotent). Admin-gated.
+    pub fn revoke_scope(env: Env, who: Address, scope: RoleScope) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        let mut scopes = StorageClient::get_scopes(&env, &who);
+        if let Some(i) = scopes.first_index_of(scope) {
+            scopes.remove(i);
+            StorageClient::set_scopes(&env, &who, &scopes);
+        }
+        Ok(())
+    }
+
+    /// Return whether `who` has been explicitly granted `scope`.
+    pub fn has_scope(env: Env, who: Address, scope: RoleScope) -> bool {
+        StorageClient::get_scopes(&env, &who).contains(scope)
+    }
+
     /// Set the anchor/issuer IDs `signer` may register callbacks for. Admin only.
     ///
     /// An empty list means unrestricted (all anchors) - the migration-friendly
@@ -1045,18 +1119,6 @@ impl SynapseCoreContract {
     /// (restarting the delay). With an N-of-M set (#65) only the primary
     /// signer slot is replaced; membership/threshold changes stay immediate
     /// admin operations.
-    ///
-    /// # Events
-    /// Emits [`events::EventRelaySignerProposed`].
-    pub fn propose_relay_signer(env: Env, new_signer: Address) -> Result<(), ContractError> {
-        AdminClient::require_admin(&env)?;
-        let current = StorageClient::get_relay_signer(&env)?;
-        StorageClient::set_pending_relay_signer(&env, Some(&new_signer));
-        EventEmitter::relay_signer_proposed(&env, &current, &new_signer);
-        Ok(())
-    }
-
-    /// Complete a relay-signer rotation
     ///
     /// # Events
     /// Emits [`events::EventRelaySignerProposed`].
@@ -1191,6 +1253,7 @@ impl SynapseCoreContract {
         EventEmitter::relay_threshold_changed(&env, old, threshold);
         Ok(())
     }
+    }
 
     // ── Contract upgrade ───────────────────────────────────────────────────────
 
@@ -1246,6 +1309,93 @@ impl SynapseCoreContract {
         let admin = AdminClient::require_admin(&env)?;
         StorageClient::set_paused(&env, true);
         EventEmitter::pause_toggled(&env, true, &admin);
+        Ok(())
+    }
+
+    /// Set the guardian set. Admin-gated; simple (non-timelocked) rotation,
+    /// flagged as a fast-follow. Replaces any previous set.
+    pub fn set_guardians(
+        env: Env,
+        guardians: soroban_sdk::Vec<Address>,
+    ) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        StorageClient::set_guardians(&env, &guardians);
+        Ok(())
+    }
+
+    /// Set the guardian quorum M for [`Self::revoke_admin_emergency`].
+    /// Admin-gated; must satisfy `1 <= m <= guardians.len()`.
+    pub fn set_guardian_threshold(env: Env, m: u32) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        if m == 0 || m > StorageClient::get_guardians(&env).len() {
+            return Err(ContractError::QuorumNotMet);
+        }
+        StorageClient::set_guardian_threshold(&env, m);
+        Ok(())
+    }
+
+    /// Break-glass: revoke the admin entirely with an M-of-N guardian quorum.
+    ///
+    /// `approvers` must contain at least M distinct guardians, each of which
+    /// must authorise the call; one short of M is rejected. On success the
+    /// contract is paused and enters the documented "admin vacant" state: every
+    /// admin-gated entry point fails with [`ContractError::AdminVacant`], while
+    /// `guardian_pause`, reads and (via the stored relay signer) nothing that
+    /// needs admin remain. Bootstrapping a new admin is a tracked follow-up
+    /// (see `docs/adr/0004-guardian-emergency-admin-revocation.md`).
+    ///
+    /// # Events
+    /// Emits [`events::EventAdminRevokedEmergency`].
+    pub fn revoke_admin_emergency(
+        env: Env,
+        approvers: soroban_sdk::Vec<Address>,
+    ) -> Result<(), ContractError> {
+        let threshold = StorageClient::get_guardian_threshold(&env);
+        if threshold == 0 {
+            return Err(ContractError::QuorumNotMet);
+        }
+        let guardians = StorageClient::get_guardians(&env);
+        let mut seen: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        for a in approvers.iter() {
+            if !guardians.contains(&a) {
+                return Err(ContractError::NotGuardian);
+            }
+            if !seen.contains(&a) {
+                a.require_auth();
+                seen.push_back(a);
+            }
+        }
+        if seen.len() < threshold {
+            return Err(ContractError::QuorumNotMet);
+        }
+        let admin = StorageClient::get_admin(&env)?;
+        StorageClient::vacate_admin(&env);
+        StorageClient::set_paused(&env, true);
+        EventEmitter::admin_revoked_emergency(&env, &admin, seen.len());
+        Ok(())
+    }
+
+    /// Return the configured guardian set.
+    pub fn guardians(env: Env) -> soroban_sdk::Vec<Address> {
+        StorageClient::get_guardians(&env)
+    }
+
+    /// Engage the circuit breaker on guardian authority alone, without admin
+    /// rights, so an incident responder can halt the contract when the admin
+    /// key is suspected compromised. Idempotent.
+    ///
+    /// Design choice: **unpause remains admin-only**. A guardian that is also
+    /// the admin is harmless: it simply passes either check.
+    ///
+    /// # Events
+    /// Emits [`events::EventGuardianPaused`] (not `EventPauseToggled`).
+    pub fn guardian_pause(env: Env, caller: Address) -> Result<(), ContractError> {
+        if !StorageClient::get_guardians(&env).contains(&caller) {
+            return Err(ContractError::NotGuardian);
+        }
+        caller.require_auth();
+        StorageClient::set_paused(&env, true);
+        EventEmitter::guardian_paused(&env, &caller);
         Ok(())
     }
 

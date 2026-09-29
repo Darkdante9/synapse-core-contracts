@@ -26,6 +26,37 @@ use crate::types::TransactionStatus;
 
 // ─── Event data structs ───────────────────────────────────────────────────────
 
+/// Emitted by [`SynapseCoreContract::revoke_admin_emergency`]. Alert on this.
+#[contracttype]
+pub struct EventAdminRevokedEmergency {
+    pub revoked_admin: soroban_sdk::Address,
+    pub approvals: u32,
+    pub ledger: u32,
+}
+
+/// Emitted by [`SynapseCoreContract::guardian_pause`]; distinct from
+/// [`EventPauseToggled`] so forensics can tell guardian pauses apart.
+#[contracttype]
+pub struct EventGuardianPaused {
+    pub guardian: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
+/// Emitted by [`SynapseCoreContract::heartbeat`].
+#[contracttype]
+pub struct EventHeartbeat {
+    pub signer: soroban_sdk::Address,
+    pub timestamp: u64,
+}
+
+/// Emitted by [`SynapseCoreContract::clear_quarantine`].
+#[contracttype]
+pub struct EventQuarantineCleared {
+    pub signer: soroban_sdk::Address,
+    pub admin: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
 /// Emitted by [`SynapseCoreContract::initialize`].
 #[contracttype]
 pub struct EventInitialised {
@@ -585,6 +616,17 @@ impl EventEmitter {
         );
     }
 
+    /// Emit [`EventHeartbeat`].
+    pub fn heartbeat(env: &Env, signer: &soroban_sdk::Address) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("hbeat")),
+            EventHeartbeat {
+                signer: signer.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
     /// Emit [`EventTransactionExpired`].
     pub fn transaction_expired(env: &Env, tx_id: &String, registered_at: u64) {
         env.events().publish(
@@ -594,6 +636,9 @@ impl EventEmitter {
                 registered_at,
                 expired_at: env.ledger().timestamp(),
                 ledger: env.ledger().sequence(),
+            },
+        );
+    }
             },
         );
     }
@@ -624,6 +669,51 @@ impl EventEmitter {
                 original_amount,
                 settled_amount,
                 stellar_tx_hash: stellar_tx_hash.clone(),
+            },
+        );
+    }
+
+    /// Emit [`EventTransactionExpired`].
+    pub fn transaction_expired(env: &Env, tx_id: &String, registered_at: u64) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("expired")),
+            EventTransactionExpired {
+                tx_id: tx_id.clone(),
+                registered_at,
+                expired_at: env.ledger().timestamp(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventQuarantineCleared`].
+    pub fn quarantine_cleared(
+        env: &Env,
+        signer: &soroban_sdk::Address,
+        admin: &soroban_sdk::Address,
+    ) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("qclear")),
+            EventQuarantineCleared {
+                signer: signer.clone(),
+                admin: admin.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventGuardianPaused`].
+    pub fn guardian_paused(env: &Env, guardian: &soroban_sdk::Address) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("gpause")),
+            EventGuardianPaused {
+                guardian: guardian.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventAdminRevokedEmerge
                 ledger: env.ledger().sequence(),
             },
         );
@@ -666,6 +756,37 @@ impl EventEmitter {
                 tx_id: tx_id.clone(),
                 tag: tag.clone(),
                 tag_count,
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventGuardianPaused`].
+    pub fn guardian_paused(env: &Env, guardian: &soroban_sdk::Address) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("gpause")),
+            EventGuardianPaused {
+                guardian: guardian.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventAdminRevokedEmergency`].
+    pub fn admin_revoked_emergency(
+        env: &Env,
+        revoked_admin: &soroban_sdk::Address,
+        approvals: u32,
+    ) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("adm_rev")),
+            EventAdminRevokedEmergency {
+                revoked_admin: revoked_admin.clone(),
+                approvals,
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
                 ledger: env.ledger().sequence(),
             },
         );

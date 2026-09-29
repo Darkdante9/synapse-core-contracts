@@ -69,7 +69,11 @@ impl StorageClient {
         env.storage()
             .persistent()
             .get(&StorageKey::Admin)
-            .ok_or(ContractError::NotInitialised)
+            .ok_or(if Self::is_admin_vacant(env) {
+                ContractError::AdminVacant
+            } else {
+                ContractError::NotInitialised
+            })
     }
 
     /// Persist an admin address.
@@ -621,5 +625,105 @@ impl StorageClient {
             IDEMPOTENCY_TTL_LEDGERS,
             IDEMPOTENCY_TTL_LEDGERS,
         );
+    }
+
+    // ── Relay-signer liveness ─────────────────────────────────────────────────
+
+    /// Last heartbeat ledger timestamp recorded for `signer`, if any.
+    pub fn get_last_heartbeat(env: &Env, signer: &Address) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::LastHeartbeat(signer.clone()))
+    }
+
+    /// Record `ts` as `signer`'s last heartbeat.
+    pub fn set_last_heartbeat(env: &Env, signer: &Address, ts: u64) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::LastHeartbeat(signer.clone()), &ts);
+    }
+
+    /// Staleness window in seconds; `0` (default) disables quarantine.
+    pub fn get_heartbeat_window(env: &Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::HeartbeatWindow)
+            .unwrap_or(0)
+    }
+
+    /// Persist the staleness window in seconds.
+    pub fn set_heartbeat_window(env: &Env, secs: u64) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::HeartbeatWindow, &secs);
+    }
+
+    // ── Role scopes ───────────────────────────────────────────────────────────
+
+    /// Scopes granted to `who` (empty when none).
+    pub fn get_scopes(env: &Env, who: &Address) -> soroban_sdk::Vec<crate::types::RoleScope> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Scopes(who.clone()))
+            .unwrap_or(soroban_sdk::Vec::new(env))
+    }
+
+    /// Persist the scope set for `who`.
+    pub fn set_scopes(
+        env: &Env,
+        who: &Address,
+        scopes: &soroban_sdk::Vec<crate::types::RoleScope>,
+    ) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Scopes(who.clone()), scopes);
+    }
+
+    // ── Guardians ─────────────────────────────────────────────────────────────
+
+    /// Current guardian set (empty when none configured).
+    pub fn get_guardians(env: &Env) -> soroban_sdk::Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Guardians)
+            .unwrap_or(soroban_sdk::Vec::new(env))
+    }
+
+    /// Persist the guardian set.
+    pub fn set_guardians(env: &Env, guardians: &soroban_sdk::Vec<Address>) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Guardians, guardians);
+    }
+
+    // ── Emergency admin revocation ────────────────────────────────────────────
+
+    /// Guardian quorum M (0 = unset).
+    pub fn get_guardian_threshold(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Persist the guardian quorum M.
+    pub fn set_guardian_threshold(env: &Env, m: u32) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::GuardianThreshold, &m);
+    }
+
+    /// Whether the admin was revoked via break-glass.
+    pub fn is_admin_vacant(env: &Env) -> bool {
+        env.storage().persistent().has(&StorageKey::AdminVacant)
+    }
+
+    /// Remove the admin and mark the role vacant.
+    pub fn vacate_admin(env: &Env) {
+        env.storage().persistent().remove(&StorageKey::Admin);
+        env.storage().persistent().remove(&StorageKey::PendingAdmin);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::AdminVacant, &true);
     }
 }

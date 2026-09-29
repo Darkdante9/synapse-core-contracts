@@ -83,7 +83,6 @@ impl AdminClient {
     /// Assert that `caller` is specifically the relay signer (not the admin).
     ///
     /// Used by `register_callback` — only the relay may ingest callbacks.
-    #[allow(dead_code)]
     pub fn require_relay_signer(env: &Env, caller: &Address) -> Result<(), ContractError> {
         let set = StorageClient::get_relay_signer_set(env)?;
         if !set.signers.contains(caller) {
@@ -126,6 +125,48 @@ impl AdminClient {
         for s in set.signers.iter() {
             StorageClient::clear_relay_approval(env, &s);
         }
+        Ok(())
+    }
+
+    /// Reject `signer` with [`ContractError::SignerQuarantined`] when its last
+    /// heartbeat is older than the configured window.
+    ///
+    /// A signer that has never heartbeated, or a window of `0`, is never
+    /// quarantined (backward compatible). Staleness is strict: a signer is
+    /// quarantined only when `now - last_heartbeat > window`.
+    pub fn assert_not_quarantined(env: &Env, signer: &Address) -> Result<(), ContractError> {
+        let window = StorageClient::get_heartbeat_window(env);
+        if window == 0 {
+            return Ok(());
+        }
+        if let Some(last) = StorageClient::get_last_heartbeat(env, signer) {
+            if env.ledger().timestamp().saturating_sub(last) > window {
+                return Err(ContractError::SignerQuarantined);
+            }
+        }
+        Ok(())
+    }
+
+    /// Assert that `caller` holds `scope`, then require its auth.
+    ///
+    /// The admin and relay signer implicitly hold all scopes. Any other caller
+    /// lacking the scope gets the same [`ContractError::Unauthorised`] as an
+    /// unknown address, so error output does not reveal which addresses hold
+    /// other scopes.
+    pub fn require_scope(
+        env: &Env,
+        caller: &Address,
+        scope: crate::types::RoleScope,
+    ) -> Result<(), ContractError> {
+        let admin = StorageClient::get_admin(env)?;
+        let relay = StorageClient::get_relay_signer(env)?;
+        if caller != &admin
+            && caller != &relay
+            && !StorageClient::get_scopes(env, caller).contains(scope)
+        {
+            return Err(ContractError::Unauthorised);
+        }
+        caller.require_auth();
         Ok(())
     }
 }
