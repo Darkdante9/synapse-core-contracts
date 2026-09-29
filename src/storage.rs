@@ -10,6 +10,7 @@
 //! | Admin, relay signer   | `persistent` | Must survive archive/restore cycles      |
 //! | Transactions          | `persistent` | Long-lived; needed for audit trail       |
 //! | Idempotency keys      | `temporary`  | 24-hour TTL; evicted by the ledger       |
+//! | Promoted idem. keys   | `persistent` | Dispute evidence; survives TTL eviction  |
 //! | Initialised flag      | `instance`   | Lives with the contract instance         |
 //!
 //! ## Temporary-tier read semantics
@@ -36,6 +37,12 @@ const IDEMPOTENCY_TTL_LEDGERS: u32 = 18_000;
 
 /// Minimum TTL we require on transaction records before extending.
 const TRANSACTION_MIN_TTL_LEDGERS: u32 = 100_000; // ~1 week
+
+/// Minimum TTL applied to promoted (persistent) idempotency keys.
+///
+/// Promoted keys back an active dispute investigation, so they are kept for
+/// the same ~1 week window as transaction records and refreshed on access.
+const PROMOTED_IDEMPOTENCY_MIN_TTL_LEDGERS: u32 = 100_000; // ~1 week
 
 pub struct StorageClient;
 
@@ -764,6 +771,86 @@ impl StorageClient {
             IDEMPOTENCY_TTL_LEDGERS,
             IDEMPOTENCY_TTL_LEDGERS,
         );
+    }
+
+    // ── Idempotency key promotion (dispute evidence) ──────────────────────────
+
+    /// Returns `true` if `key` currently lives in the persistent (promoted) tier.
+    pub fn is_idempotency_key_promoted(env: &Env, key: &String) -> bool {
+        env.storage()
+            .persistent()
+            .has(&StorageKey::PromotedIdempotencyKey(key.clone()))
+    }
+
+    /// Read a promoted idempotency key's original ledger sequence, if present.
+    ///
+    /// Extends the persistent TTL on each access so an in-flight dispute
+    /// investigation never loses its evidence mid-review.
+    pub fn get_promoted_idempotency_key(env: &Env, key: &String) -> Option<u32> {
+        let storage_key = StorageKey::PromotedIdempotencyKey(key.clone());
+        let seq = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, u32>(&storage_key)?;
+        env.storage().persistent().extend_ttl(
+            &storage_key,
+            PROMOTED_IDEMPOTENCY_MIN_TTL_LEDGERS,
+            PROMOTED_IDEMPOTENCY_MIN_TTL_LEDGERS,
+        );
+        Some(seq)
+    }
+
+    /// Promote an idempotency key from the temporary tier to the persistent tier.
+    ///
+    /// Reads the key's original ledger sequence from temporary storage and
+    /// re-writes it under [`StorageKey::PromotedIdempotencyKey`] in persistent
+    /// storage, then removes the temporary entry.  Returns the promoted ledger
+    /// sequence on success.
+    ///
+    /// Fails with [`ContractError::IdempotencyKeyNotFound`] when the key is
+    /// unknown or has already been evicted by the ledger's temporary TTL — the
+    /// caller must surface this as a graceful "nothing to promote" error rather
+    /// than panicking.
+    pub fn promote_idempotency_key(env: &Env, key: &String) -> Result<u32, ContractError> {
+        let seq = Self::get_idempotency_key(env, key)
+            .ok_or(ContractError::IdempotencyKeyNotFound)?;
+        let storage_key = StorageKey::PromotedIdempotencyKey(key.clone());
+        env.storage().persistent().set(&storage_key, &seq);
+        env.storage().persistent().extend_ttl(
+            &storage_key,
+            PROMOTED_IDEMPOTENCY_MIN_TTL_LEDGERS,
+            PROMOTED_IDEMPOTENCY_MIN_TTL_LEDGERS,
+        );
+        env.storage()
+            .temporary()
+            .remove(&StorageKey::IdempotencyKey(key.clone()));
+        Ok(seq)
+    }
+
+    /// Demote a previously promoted idempotency key back to the temporary tier.
+    ///
+    /// Used once a dispute resolves so persistent storage is not permanently
+    /// bloated with every disputed key.  Returns `true` when a promoted entry
+    /// was found and demoted, `false` when the key was not promoted (a no-op).
+    pub fn demote_idempotency_key(env: &Env, key: &String) -> bool {
+        let storage_key = StorageKey::PromotedIdempotencyKey(key.clone());
+        let seq = match env
+            .storage()
+            .persistent()
+            .get::<StorageKey, u32>(&storage_key)
+        {
+            Some(seq) => seq,
+            None => return false,
+        };
+        env.storage().persistent().remove(&storage_key);
+        let temp_key = StorageKey::IdempotencyKey(key.clone());
+        env.storage().temporary().set(&temp_key, &seq);
+        env.storage().temporary().extend_ttl(
+            &temp_key,
+            IDEMPOTENCY_TTL_LEDGERS,
+            IDEMPOTENCY_TTL_LEDGERS,
+        );
+        true
     }
 
     // ── Relay-signer liveness ─────────────────────────────────────────────────
