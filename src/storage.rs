@@ -26,8 +26,8 @@
 use soroban_sdk::{Address, Env, String, Vec};
 
 use crate::types::{
-    DEFAULT_AMOUNT_CEILING, ContractError, PendingRelaySigner, RelaySignerSet, StorageKey, Transaction,
-    TransactionStatus, TransitionRecord, MAX_HISTORY_LEN,
+    DEFAULT_AMOUNT_CEILING, ContractError, PendingRelaySigner, RelaySignerSet, StorageFootprintReport,
+    StorageKey, Transaction, TransactionStatus, TransitionRecord, MAX_HISTORY_LEN,
 };
 
 /// TTL extension in ledgers applied to idempotency keys (~24 hours at ~5s/ledger).
@@ -43,6 +43,41 @@ const TRANSACTION_MIN_TTL_LEDGERS: u32 = 100_000; // ~1 week
 /// Promoted keys back an active dispute investigation, so they are kept for
 /// the same ~1 week window as transaction records and refreshed on access.
 const PROMOTED_IDEMPOTENCY_MIN_TTL_LEDGERS: u32 = 100_000; // ~1 week
+
+/// TTL (in ledgers) applied to a transaction record by an explicit maintenance
+/// bump.  Larger than [`TRANSACTION_MIN_TTL_LEDGERS`] so an operator-triggered
+/// bump meaningfully extends the archival horizon of a still-relevant record
+/// (e.g. one that remains `Disputed`).  ~30 days at ~5s/ledger.
+const TRANSACTION_BUMP_TTL_LEDGERS: u32 = 518_400;
+
+/// Maximum number of transaction records a single
+/// [`StorageClient::bump_transactions_ttl`] call may extend.
+///
+/// Bounds the per-call resource cost so a large backlog is maintained across
+/// several invocations rather than in a single unbounded sweep.
+pub const TTL_BUMP_BATCH_SIZE: u32 = 25;
+
+/// Maximum number of temporary idempotency-key entries evicted per
+/// [`StorageClient::drain_expiring_temp_storage`] call.
+///
+/// Bounds the per-call resource cost so a large backlog is cleared across
+/// several invocations rather than in a single unbounded sweep.
+pub const DRAIN_BATCH_SIZE: u32 = 25;
+
+/// Approximate on-chain byte size attributed to a single persistent entry
+/// (key + value + ledger bookkeeping) for cost-model footprint estimates.
+///
+/// Soroban does not expose a native per-entry byte-size primitive, so this is a
+/// deliberately conservative constant used only to turn entry *counts* into an
+/// order-of-magnitude size estimate.  It is intentionally coarse: the report's
+/// contract is that counts are exact and sizes are approximate.
+const APPROX_BYTES_PER_PERSISTENT_ENTRY: u32 = 128;
+
+/// Approximate byte size attributed to a single temporary entry.
+const APPROX_BYTES_PER_TEMPORARY_ENTRY: u32 = 96;
+
+/// Approximate byte size attributed to a single instance entry.
+const APPROX_BYTES_PER_INSTANCE_ENTRY: u32 = 64;
 
 pub struct StorageClient;
 
@@ -500,6 +535,18 @@ impl StorageClient {
         );
     }
 
+    /// Extend the persistent-storage TTL of a single transaction record.
+    ///
+    /// Uses Soroban's native `extend_ttl` ledger primitive directly rather than
+    /// reimplementing TTL bookkeeping in contract storage.  The record's TTL is
+    /// raised to [`TRANSACTION_BUMP_TTL_LEDGERS`] whenever it currently sits
+    /// below that threshold, keeping a still-relevant record (e.g. one that
+    /// remains `Disputed`) from being archived out from under the audit trail.
+    ///
+    /// Fails cleanly with [`ContractError::TransactionNotFound`] when no record
+    /// exists for `tx_id`, so a maintenance job cannot silently no-op on a
+    /// mistyped o
+
     // ── Merge markers ─────────────────────────────────────────────────────────
 
     /// Return the canonical tx id `tx_id` was merged into, if any.
@@ -537,7 +584,6 @@ impl StorageClient {
             timestamp: env.ledger().timestamp(),
         });
         env.storage().persistent().set(&key, &h);
-    }
         env.storage().persistent().extend_ttl(
             &key,
             TRANSACTION_MIN_TTL_LEDGERS,
@@ -760,17 +806,87 @@ impl StorageClient {
             .get::<StorageKey, u32>(&StorageKey::IdempotencyKey(key.clone()))
     }
 
-    /// Record an idempotency key with a ~24-hour TTL.
-    pub fn set_idempotency_key(env: &Env, key: &String) {
-        let storage_key = StorageKey::IdempotencyKey(key.clone());
+    // ── Footprint diagnostics ─────────────────────────────────────────────────
+
+    /// Build a point-in-time [`StorageFootprintReport`] of the contract's
+    /// storage footprint, broken down by tier.
+    ///
+    /// Soroban exposes no native "enumerate all entries" primitive, so counts
+    /// are derived from the same counters/indexes the rest of this Wave's
+    /// storage-tracking work maintains (the per-status index and the history
+    /// log) rather than from an independent counting mechanism.  This keeps the
+    /// report consistent with the state-transition entry points that write
+    /// those indexes: whenever a new storage-writing feature lands, the
+    /// counters it maintains must be updated here too.
+    ///
+    /// Counts are exact for the tiers that are tracked by an index; sizes are
+    /// deliberately approximate (see the `APPROX_BYTES_PER_*` constants) and
+    /// exist only to let `COST_MODEL.md`'s projections be sanity-checked
+    /// against real on-chain state.  This is a read-only, point-in-time query —
+    /// continuous monitoring is out of scope.
+    pub fn storage_footprint(env: &Env) -> StorageFootprintReport {
+        // Persistent tier: the singleton config entries (admin, relay signer,
+        // schema version) plus every transaction record tracked by the history
+        // log.  The history log is the authoritative index of transaction
+        // records, so its length is the persistent entry count.
+        let history_len = Self::history_log_len(env);
+        let persistent_entries = history_len.saturating_add(3);
+
+        // Temporary tier: idempotency keys, tracked by the per-status index
+        // maintained alongside each write.  Falls back to zero when the index
+        // has never been written.
+        let temporary_entries = Self::idempotency_index_len(env);
+
+        // Instance tier: the initialised flag and the pause flag.
+        let instance_entries: u32 = 2;
+
+        StorageFootprintReport {
+            persistent_entries,
+            persistent_bytes: persistent_entries.saturating_mul(APPROX_BYTES_PER_PERSISTENT_ENTRY),
+            temporary_entries,
+            temporary_bytes: temporary_entries.saturating_mul(APPROX_BYTES_PER_TEMPORARY_ENTRY),
+            instance_entries,
+            instance_bytes: instance_entries.saturating_mul(APPROX_BYTES_PER_INSTANCE_ENTRY),
+        }
+    }
+
+    /// Number of transaction records currently tracked by the history log.
+    ///
+    /// Reads the length counter maintained by the history-log storage work in
+    /// this Wave; returns `0` when the log has never been written so a fresh
+    /// deployment reports an empty footprint rather than erroring.
+    fn history_log_len(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::HistoryLogLen)
+            .unwrap_or(0)
+    }
+
+    /// Number
+    }
+
+    /// Number of transaction records currently tracked by the history log.
+    ///
+    /// Reads the length counter maintained by the history-log storage work in
+    /// this Wave; returns `0` when the log has never been written so a fresh
+    /// deployment reports an empty footprint rather than erroring.
+    fn history_log_len(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::HistoryLogLen)
+            .unwrap_or(0)
+    }
+
+    /// Number of temporary idempotency-key entries currently tracked by the
+    /// per-status index.
+    ///
+    /// Reads the length counter maintained by the per-status-index storage work
+    /// in this Wave; returns `0` when the index has never been written.
+    fn idempotency_index_len(env: &Env) -> u32 {
         env.storage()
             .temporary()
-            .set(&storage_key, &env.ledger().sequence());
-        env.storage().temporary().extend_ttl(
-            &storage_key,
-            IDEMPOTENCY_TTL_LEDGERS,
-            IDEMPOTENCY_TTL_LEDGERS,
-        );
+            .get(&StorageKey::IdempotencyIndexLen)
+            .unwrap_or(0)
     }
 
     // ── Idempotency key promotion (dispute evidence) ──────────────────────────
