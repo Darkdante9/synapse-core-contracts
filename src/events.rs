@@ -46,6 +46,32 @@ pub struct EventTransactionRegistered {
     pub ledger: u32,
 }
 
+/// Emitted by [`SynapseCoreContract::cancel_transaction`].
+#[contracttype]
+pub struct EventTransactionCancelled {
+    pub tx_id: String,
+    pub reason: String,
+    pub caller: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
+/// Emitted by [`SynapseCoreContract::retry_transaction`].
+#[contracttype]
+pub struct EventTransactionRetried {
+    pub tx_id: String,
+    pub retry_count: u32,
+    pub ledger: u32,
+}
+
+/// Emitted once by [`SynapseCoreContract::batch_register_callback`] after all
+/// per-transaction `TransactionRegistered` events.
+#[contracttype]
+pub struct EventBatchProcessed {
+    pub count: u32,
+    pub caller: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
 /// Emitted on every status change driven by [`SynapseCoreContract::start_processing`],
 /// [`SynapseCoreContract::complete_transaction`], or
 /// [`SynapseCoreContract::fail_transaction`].
@@ -275,6 +301,48 @@ impl EventEmitter {
             EventTransactionFailed {
                 tx_id: tx_id.clone(),
                 reason: reason.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventTransactionCancelled`].
+    pub fn transaction_cancelled(
+        env: &Env,
+        tx_id: &String,
+        reason: &String,
+        caller: &soroban_sdk::Address,
+    ) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("cancel")),
+            EventTransactionCancelled {
+                tx_id: tx_id.clone(),
+                reason: reason.clone(),
+                caller: caller.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventTransactionRetried`].
+    pub fn transaction_retried(env: &Env, tx_id: &String, retry_count: u32) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("retry")),
+            EventTransactionRetried {
+                tx_id: tx_id.clone(),
+                retry_count,
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventBatchProcessed`].
+    pub fn batch_processed(env: &Env, count: u32, caller: &soroban_sdk::Address) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("batch")),
+            EventBatchProcessed {
+                count,
+                caller: caller.clone(),
                 ledger: env.ledger().sequence(),
             },
         );

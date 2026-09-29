@@ -12,9 +12,9 @@
 //! | Idempotency keys      | `temporary`  | 24-hour TTL; evicted by the ledger       |
 //! | Initialised flag      | `instance`   | Lives with the contract instance         |
 
-use soroban_sdk::{Address, Env, String};
+use soroban_sdk::{Address, Env, String, Vec};
 
-use crate::types::{ContractError, StorageKey, Transaction};
+use crate::types::{ContractError, StorageKey, Transaction, TransactionStatus};
 
 /// TTL extension in ledgers applied to idempotency keys (~24 hours at ~5s/ledger).
 ///
@@ -160,14 +160,81 @@ impl StorageClient {
     }
 
     /// Persist (insert or update) a [`Transaction`].
+    ///
+    /// Also keeps the per-status index in sync. Trade-off: each status change
+    /// costs one extra read plus up to two index writes (removal is O(n) in
+    /// the size of the old status bucket), in exchange for O(page) reads in
+    /// `get_transactions_by_status`.
     pub fn save_transaction(env: &Env, tx: &Transaction) {
         let key = StorageKey::Transaction(tx.id.clone());
+        let old = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, Transaction>(&key);
+        match old {
+            Some(old) if old.status == tx.status => {}
+            Some(old) => {
+                Self::index_remove(env, &old.status, &tx.id);
+                Self::index_push(env, &tx.status, &tx.id);
+            }
+            None => Self::index_push(env, &tx.status, &tx.id),
+        }
         env.storage().persistent().set(&key, tx);
         env.storage().persistent().extend_ttl(
             &key,
             TRANSACTION_MIN_TTL_LEDGERS,
             TRANSACTION_MIN_TTL_LEDGERS,
         );
+    }
+
+    fn index_push(env: &Env, status: &TransactionStatus, id: &String) {
+        let key = StorageKey::StatusIndex(status.clone());
+        let mut ids = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, Vec<String>>(&key)
+            .unwrap_or(Vec::new(env));
+        ids.push_back(id.clone());
+        env.storage().persistent().set(&key, &ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TRANSACTION_MIN_TTL_LEDGERS, TRANSACTION_MIN_TTL_LEDGERS);
+    }
+
+    fn index_remove(env: &Env, status: &TransactionStatus, id: &String) {
+        let key = StorageKey::StatusIndex(status.clone());
+        if let Some(mut ids) = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, Vec<String>>(&key)
+        {
+            if let Some(pos) = ids.first_index_of(id) {
+                ids.remove(pos);
+                env.storage().persistent().set(&key, &ids);
+            }
+        }
+    }
+
+    /// Return up to `limit` transaction IDs in `status`, starting at `start`.
+    pub fn get_ids_by_status(
+        env: &Env,
+        status: &TransactionStatus,
+        start: u32,
+        limit: u32,
+    ) -> Vec<String> {
+        let ids = env
+            .storage()
+            .persistent()
+            .get::<StorageKey, Vec<String>>(&StorageKey::StatusIndex(status.clone()))
+            .unwrap_or(Vec::new(env));
+        let end = start.saturating_add(limit).min(ids.len());
+        let mut out = Vec::new(env);
+        let mut i = start;
+        while i < end {
+            out.push_back(ids.get_unchecked(i));
+            i += 1;
+        }
+        out
     }
 
     // ── Idempotency keys ──────────────────────────────────────────────────────

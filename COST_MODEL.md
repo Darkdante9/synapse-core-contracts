@@ -240,3 +240,14 @@ account for off-chain monitoring reads.
 entry via megabyte-sized strings.  The caps close this vector with negligible
 impact on typical usage.
 
+
+## Batch registration (`batch_register_callback`)
+
+Batch size is capped at `MAX_BATCH_SIZE` (20). Worst case is 20 payloads with
+max-length string fields: each payload costs one persistent write for the
+transaction (~512 B fee-rounded, see section 2), one temporary write for the
+idempotency key, one status-index update, and one event, plus a single
+`EventBatchProcessed`. Validation runs over the whole batch before any write,
+including an O(n^2) in-batch duplicate check (at most 190 comparisons). The
+cap is deliberately conservative to stay well under the per-transaction
+resource limits; raise it only after benchmarking.

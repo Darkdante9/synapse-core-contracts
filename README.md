@@ -33,6 +33,7 @@ three-phase lifecycle that ultimately bridges fiat deposits to cross-chain asset
 ```
 Pending ──► Processing ──► Completed
         └──────────────► Failed
+        └──────────────► Cancelled   (cancel_transaction; from Pending/Processing)
 ```
 
 | Transition              | Caller            | Entry-point              |
@@ -41,6 +42,7 @@ Pending ──► Processing ──► Completed
 | `Pending → Processing`  | relay or admin    | `start_processing()`     |
 | `Processing → Completed`| relay or admin    | `complete_transaction()` |
 | `* → Failed`            | relay or admin    | `fail_transaction()`     |
+| `Pending/Processing → Cancelled` | relay or admin | `cancel_transaction()` |
 
 ---
 

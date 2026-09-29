@@ -37,13 +37,13 @@ mod test_pause;
 #[cfg(test)]
 mod tests;
 
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String};
+use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};
 
 use crate::admin::AdminClient;
 use crate::events::EventEmitter;
 use crate::storage::StorageClient;
 use crate::types::{
-    CallbackPayload, ContractError, Transaction, TransactionStatus, SCHEMA_VERSION,
+    CallbackPayload, ContractError, Transaction, TransactionStatus, MAX_BATCH_SIZE, MAX_PAGE_LIMIT, MAX_RETRIES, SCHEMA_VERSION,
 };
 use crate::validation::Validator;
 
@@ -147,6 +147,7 @@ impl SynapseCoreContract {
             callback_status: payload.callback_status.clone(),
             stellar_tx_hash: String::from_str(&env, ""),
             failure_reason: String::from_str(&env, ""),
+            retry_count: 0,
         };
 
         StorageClient::save_transaction(&env, &tx);
@@ -154,6 +155,75 @@ impl SynapseCoreContract {
         EventEmitter::transaction_registered(&env, &tx);
 
         Ok(tx.id)
+    }
+
+    /// Register up to [`MAX_BATCH_SIZE`] callbacks atomically.
+    ///
+    /// Relay signer only. Every payload is validated, and checked against
+    /// on-chain and in-batch duplicate `transaction_id`s, *before* any storage
+    /// write; any failure aborts the whole call with no partial writes.
+    /// An empty or oversized batch is rejected with
+    /// [`ContractError::InvalidBatchSize`].
+    ///
+    /// # Events
+    /// Emits [`events::EventTransactionRegistered`] per payload followed by one
+    /// [`events::EventBatchProcessed`].
+    pub fn batch_register_callback(
+        env: Env,
+        payloads: Vec<CallbackPayload>,
+        caller: Address,
+    ) -> Result<u32, ContractError> {
+        if StorageClient::is_paused(&env) {
+            return Err(ContractError::ContractPaused);
+        }
+        AdminClient::require_relay_signer(&env, &caller)?;
+        caller.require_auth();
+
+        let n = payloads.len();
+        if n == 0 || n > MAX_BATCH_SIZE {
+            return Err(ContractError::InvalidBatchSize);
+        }
+
+        // Pass 1: validate everything; no writes.
+        for i in 0..n {
+            let p = payloads.get_unchecked(i);
+            Validator::validate_payload(&env, &p)?;
+            if StorageClient::transaction_exists(&env, &p.transaction_id) {
+                return Err(ContractError::DuplicateRequest);
+            }
+            for j in 0..i {
+                if payloads.get_unchecked(j).transaction_id == p.transaction_id {
+                    return Err(ContractError::DuplicateRequest);
+                }
+            }
+        }
+
+        // Pass 2: write.
+        let ledger = env.ledger().sequence();
+        for p in payloads.iter() {
+            let tx = Transaction {
+                id: p.transaction_id.clone(),
+                stellar_account: p.stellar_account.clone(),
+                amount: p.amount,
+                asset_code: p.asset_code.clone(),
+                asset_issuer: p.asset_issuer.clone(),
+                status: TransactionStatus::Pending,
+                created_at_ledger: ledger,
+                updated_at_ledger: ledger,
+                anchor_transaction_id: p.anchor_transaction_id.clone(),
+                callback_type: p.callback_type.clone(),
+                callback_status: p.callback_status.clone(),
+                stellar_tx_hash: String::from_str(&env, ""),
+                failure_reason: String::from_str(&env, ""),
+                retry_count: 0,
+            };
+            StorageClient::save_transaction(&env, &tx);
+            StorageClient::set_idempotency_key(&env, &p.idempotency_key);
+            EventEmitter::transaction_registered(&env, &tx);
+        }
+        EventEmitter::batch_processed(&env, n, &caller);
+
+        Ok(n)
     }
 
     // ── Status transitions ────────────────────────────────────────────────────
@@ -237,6 +307,79 @@ impl SynapseCoreContract {
         Ok(())
     }
 
+    /// Cancel a `Pending` or `Processing` transaction (terminal `Cancelled`).
+    ///
+    /// Callable only by the admin or the relay signer. `Completed` and
+    /// `Failed` records are rejected with [`ContractError::CannotCancel`];
+    /// an already-`Cancelled` record with [`ContractError::AlreadyCancelled`].
+    ///
+    /// # Events
+    /// Emits [`events::EventStatusChanged`] and
+    /// [`events::EventTransactionCancelled`].
+    pub fn cancel_transaction(
+        env: Env,
+        tx_id: String,
+        reason: String,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
+        Validator::validate_failure_reason(&reason)?;
+
+        let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
+        match tx.status {
+            TransactionStatus::Pending | TransactionStatus::Processing => {}
+            TransactionStatus::Cancelled => return Err(ContractError::AlreadyCancelled),
+            _ => return Err(ContractError::CannotCancel),
+        }
+        let old_status = tx.status.clone();
+        tx.status = TransactionStatus::Cancelled;
+        tx.failure_reason = reason.clone();
+        tx.updated_at_ledger = env.ledger().sequence();
+
+        StorageClient::save_transaction(&env, &tx);
+        EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Cancelled);
+        EventEmitter::transaction_cancelled(&env, &tx_id, &reason, &caller);
+
+        Ok(())
+    }
+
+    /// Move a `Failed` transaction back to `Pending` for reprocessing.
+    ///
+    /// Relay or admin only. Each call increments [`Transaction::retry_count`];
+    /// once it reaches [`MAX_RETRIES`] further calls fail with
+    /// [`ContractError::RetryLimitExceeded`]. The counter lives on the
+    /// persistent record, so it survives contract upgrades.
+    ///
+    /// # Events
+    /// Emits [`events::EventStatusChanged`] and
+    /// [`events::EventTransactionRetried`].
+    pub fn retry_transaction(env: Env, tx_id: String, caller: Address) -> Result<(), ContractError> {
+        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
+
+        let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
+        if tx.status != TransactionStatus::Failed {
+            return Err(ContractError::InvalidStatusTransition);
+        }
+        if tx.retry_count >= MAX_RETRIES {
+            return Err(ContractError::RetryLimitExceeded);
+        }
+        tx.retry_count += 1;
+        tx.status = TransactionStatus::Pending;
+        tx.failure_reason = String::from_str(&env, "");
+        tx.updated_at_ledger = env.ledger().sequence();
+
+        StorageClient::save_transaction(&env, &tx);
+        EventEmitter::status_changed(
+            &env,
+            &tx_id,
+            TransactionStatus::Failed,
+            TransactionStatus::Pending,
+        );
+        EventEmitter::transaction_retried(&env, &tx_id, tx.retry_count);
+
+        Ok(())
+    }
+
     // ── Read-only queries ─────────────────────────────────────────────────────
 
     /// Return the [`Transaction`] for the given `tx_id`, or
@@ -245,6 +388,27 @@ impl SynapseCoreContract {
         // Read-only: intentionally NOT gated by the pause flag — pausing must
         // never brick reads.
         StorageClient::get_transaction(&env, &tx_id)
+    }
+
+    /// Return a page of transaction IDs currently in `status`, in
+    /// registration-into-status order.
+    ///
+    /// * `cursor` — zero-based offset; pass `0` for the first page, then the
+    ///   previous `cursor + returned.len()`. An empty page means the end.
+    /// * `limit`  — page size, `1..=MAX_PAGE_LIMIT` (else
+    ///   [`ContractError::InvalidPageLimit`]).
+    ///
+    /// Read-only and not gated by the pause flag.
+    pub fn get_transactions_by_status(
+        env: Env,
+        status: TransactionStatus,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<Vec<String>, ContractError> {
+        if limit == 0 || limit > MAX_PAGE_LIMIT {
+            return Err(ContractError::InvalidPageLimit);
+        }
+        Ok(StorageClient::get_ids_by_status(&env, &status, cursor, limit))
     }
 
     /// Return the current [`TransactionStatus`] without fetching the full record.

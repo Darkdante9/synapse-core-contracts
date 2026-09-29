@@ -17,6 +17,15 @@ use soroban_sdk::{contracterror, contracttype, String};
 /// or an unexpected on-chain state, not against an incompatible new binary.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Maximum number of times a `Failed` transaction may be retried.
+pub const MAX_RETRIES: u32 = 3;
+
+/// Hard cap on the `limit` accepted by `get_transactions_by_status`.
+pub const MAX_PAGE_LIMIT: u32 = 50;
+
+/// Hard cap on the number of payloads accepted by `batch_register_callback`.
+pub const MAX_BATCH_SIZE: u32 = 20;
+
 // ─── Transaction status ───────────────────────────────────────────────────────
 
 /// Mirrors the `status` column in the `transactions` table.
@@ -24,7 +33,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// State machine:
 /// ```text
 /// Pending ──► Processing ──► Completed
-///         └──────────────► Failed
+///   │             │
+///   ├─────────────┴────────► Failed
+///   └─────────────┴────────► Cancelled
 /// ```
 #[contracttype]
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -37,6 +48,8 @@ pub enum TransactionStatus {
     Completed,
     /// Terminal failure — reason stored in [`Transaction::failure_reason`].
     Failed,
+    /// Terminal withdrawal — voided by the relay or admin before settlement.
+    Cancelled,
 }
 
 // ─── Callback type ────────────────────────────────────────────────────────────
@@ -100,6 +113,10 @@ pub struct Transaction {
 
     /// Short failure reason code — populated only on `Failed`.
     pub failure_reason: String,
+
+    /// Number of times this transaction has been moved `Failed -> Pending`
+    /// via `retry_transaction`. Capped at [`MAX_RETRIES`].
+    pub retry_count: u32,
 }
 
 // ─── Incoming webhook payload ─────────────────────────────────────────────────
@@ -172,6 +189,9 @@ pub enum StorageKey {
     /// Singleton: on-chain storage schema version, set at `initialize()`.
     /// See [`SCHEMA_VERSION`].
     SchemaVersion,
+    /// Per-status index: ordered `Vec<String>` of transaction IDs currently in
+    /// that status. Maintained by `StorageClient::save_transaction`.
+    StatusIndex(TransactionStatus),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -224,6 +244,17 @@ pub enum ContractError {
     TransactionNotFound = 30,
     /// The requested status transition violates the state machine.
     InvalidStatusTransition = 31,
+    /// The transaction is already `Cancelled`; cancelling twice is rejected.
+    AlreadyCancelled = 32,
+    /// Cancellation was requested from a state that cannot be cancelled
+    /// (`Completed` or `Failed`).
+    CannotCancel = 33,
+    /// The transaction has already used all [`MAX_RETRIES`] retries.
+    RetryLimitExceeded = 34,
+    /// A pagination `limit` was zero or exceeded `MAX_PAGE_LIMIT`.
+    InvalidPageLimit = 35,
+    /// A batch was empty or exceeded `MAX_BATCH_SIZE`.
+    InvalidBatchSize = 36,
 
     // ── Idempotency ─────────────────────────────────────────────────────────
     /// Request is a duplicate within the retention window (matches Redis 429).
