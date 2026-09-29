@@ -103,6 +103,58 @@ pub struct EventTransactionFailed {
     pub ledger: u32,
 }
 
+/// Emitted when a stale `Pending` transaction reaches terminal state `Expired`.
+#[contracttype]
+pub struct EventTransactionExpired {
+    pub tx_id: String,
+    pub registered_at: u64,
+    pub expired_at: u64,
+    pub ledger: u32,
+}
+
+/// Emitted when the admin changes the `Pending` expiry window.
+#[contracttype]
+pub struct EventExpiryWindowSet {
+    pub seconds: u64,
+    pub ledger: u32,
+}
+
+/// Emitted when a transaction is completed with less than its registered
+/// amount via `partial_complete_transaction`.
+#[contracttype]
+pub struct EventTransactionPartiallyCompleted {
+    pub tx_id: String,
+    pub original_amount: i128,
+    pub settled_amount: i128,
+    pub stellar_tx_hash: String,
+    pub ledger: u32,
+}
+
+/// Emitted when an in-flight transaction is rebound to a different relay signer.
+#[contracttype]
+pub struct EventTransactionReassigned {
+    pub tx_id: String,
+    pub old_signer: soroban_sdk::Address,
+    pub new_signer: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
+/// Emitted when the admin-approved standby signer is set.
+#[contracttype]
+pub struct EventStandbySignerSet {
+    pub signer: soroban_sdk::Address,
+    pub ledger: u32,
+}
+
+/// Emitted when a tag is appended to a transaction.
+#[contracttype]
+pub struct EventTransactionTagged {
+    pub tx_id: String,
+    pub tag: String,
+    pub tag_count: u32,
+    pub ledger: u32,
+}
+
 /// Emitted when the admin role is transferred.
 #[contracttype]
 pub struct EventAdminTransferred {
@@ -359,6 +411,92 @@ impl EventEmitter {
             EventAdminTransferred {
                 old_admin: old_admin.clone(),
                 new_admin: new_admin.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventTransactionExpired`].
+    pub fn transaction_expired(env: &Env, tx_id: &String, registered_at: u64) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("expired")),
+            EventTransactionExpired {
+                tx_id: tx_id.clone(),
+                registered_at,
+                expired_at: env.ledger().timestamp(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventExpiryWindowSet`].
+    pub fn expiry_window_set(env: &Env, seconds: u64) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("exp_win")),
+            EventExpiryWindowSet {
+                seconds,
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventTransactionPartiallyCompleted`].
+    pub fn transaction_partially_completed(
+        env: &Env,
+        tx_id: &String,
+        original_amount: i128,
+        settled_amount: i128,
+        stellar_tx_hash: &String,
+    ) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("partial")),
+            EventTransactionPartiallyCompleted {
+                tx_id: tx_id.clone(),
+                original_amount,
+                settled_amount,
+                stellar_tx_hash: stellar_tx_hash.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventTransactionReassigned`].
+    pub fn transaction_reassigned(
+        env: &Env,
+        tx_id: &String,
+        old_signer: &soroban_sdk::Address,
+        new_signer: &soroban_sdk::Address,
+    ) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("reassign")),
+            EventTransactionReassigned {
+                tx_id: tx_id.clone(),
+                old_signer: old_signer.clone(),
+                new_signer: new_signer.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventStandbySignerSet`].
+    pub fn standby_signer_set(env: &Env, signer: &soroban_sdk::Address) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("standby")),
+            EventStandbySignerSet {
+                signer: signer.clone(),
+                ledger: env.ledger().sequence(),
+            },
+        );
+    }
+
+    /// Emit [`EventTransactionTagged`].
+    pub fn transaction_tagged(env: &Env, tx_id: &String, tag: &String, tag_count: u32) {
+        env.events().publish(
+            (symbol_short!("synapse"), symbol_short!("tagged")),
+            EventTransactionTagged {
+                tx_id: tx_id.clone(),
+                tag: tag.clone(),
+                tag_count,
                 ledger: env.ledger().sequence(),
             },
         );

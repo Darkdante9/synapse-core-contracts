@@ -3,7 +3,7 @@
 //! On-chain equivalents of the `synapse-core` Rust service's domain model.
 //! Every struct that touches ledger storage derives [`soroban_sdk::contracttype`].
 
-use soroban_sdk::{contracterror, contracttype, String};
+use soroban_sdk::{contracterror, contracttype, Address, String, Vec};
 
 /// Current on-chain storage schema version.
 ///
@@ -35,7 +35,8 @@ pub const MAX_BATCH_SIZE: u32 = 20;
 /// Pending ──► Processing ──► Completed
 ///   │             │
 ///   ├─────────────┴────────► Failed
-///   └─────────────┴────────► Cancelled
+///   ├─────────────┴────────► Cancelled
+///   └─────────────┴────────► Expired (permissionless, after expiry window)
 /// ```
 #[contracttype]
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -50,6 +51,9 @@ pub enum TransactionStatus {
     Failed,
     /// Terminal withdrawal — voided by the relay or admin before settlement.
     Cancelled,
+    /// Terminal: stayed `Pending` past the configured expiry window and was
+    /// expired via the permissionless `expire_transaction`.
+    Expired,
 }
 
 // ─── Callback type ────────────────────────────────────────────────────────────
@@ -117,6 +121,23 @@ pub struct Transaction {
     /// Number of times this transaction has been moved `Failed -> Pending`
     /// via `retry_transaction`. Capped at [`MAX_RETRIES`].
     pub retry_count: u32,
+
+    /// Ledger timestamp (seconds) when the transaction was registered.
+    /// Used to age out stale `Pending` entries.
+    pub registered_at: u64,
+
+    /// Amount actually settled when completed via `partial_complete_transaction`.
+    /// `None` for full completions and non-completed transactions.
+    pub settled_amount: Option<i128>,
+
+    /// Per-transaction relay signer binding set by
+    /// `reassign_relay_signer_for_transaction`. `None` means the global
+    /// relay signer applies.
+    pub assigned_signer: Option<Address>,
+
+    /// Append-only operational tags (bounded count and length; see
+    /// `validation.rs`).
+    pub tags: Vec<String>,
 }
 
 // ─── Incoming webhook payload ─────────────────────────────────────────────────
@@ -189,6 +210,12 @@ pub enum StorageKey {
     /// Singleton: on-chain storage schema version, set at `initialize()`.
     /// See [`SCHEMA_VERSION`].
     SchemaVersion,
+    /// Singleton: max age in seconds of a `Pending` transaction before it
+    /// may be expired. Absent means expiry is disabled.
+    ExpiryWindow,
+    /// Singleton: admin-approved standby relay signer, a valid reassignment
+    /// target alongside the current `relay_signer`.
+    StandbySigner,
     /// Per-status index: ordered `Vec<String>` of transaction IDs currently in
     /// that status. Maintained by `StorageClient::save_transaction`.
     StatusIndex(TransactionStatus),
@@ -269,4 +296,24 @@ pub enum ContractError {
     /// on-chain [`SchemaVersion`](StorageKey::SchemaVersion); the upgrade was
     /// aborted before touching contract WASM.
     SchemaVersionMismatch = 60,
+
+    // ── Expiry ──────────────────────────────────────────────────────────────
+    /// `expire_transaction` was called but no expiry window is configured.
+    ExpiryNotConfigured = 70,
+    /// `expire_transaction` was called before the expiry window elapsed.
+    ExpiryNotElapsed = 71,
+
+    // ── Partial settlement ──────────────────────────────────────────────────
+    /// `settled_amount` is not strictly between zero and the original amount.
+    InvalidSettledAmount = 80,
+
+    // ── Signer reassignment ─────────────────────────────────────────────────
+    /// `new_signer` is neither the relay signer nor the approved standby.
+    SignerNotTrusted = 81,
+
+    // ── Tagging ─────────────────────────────────────────────────────────────
+    /// The transaction already carries the maximum number of tags.
+    TooManyTags = 90,
+    /// The tag is empty.
+    EmptyTag = 91,
 }

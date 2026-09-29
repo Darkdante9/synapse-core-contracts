@@ -187,6 +187,34 @@ impl StorageClient {
         );
     }
 
+    // ── Expiry window ─────────────────────────────────────────────────────────
+
+    /// Read the `Pending` expiry window in seconds, if configured.
+    pub fn get_expiry_window(env: &Env) -> Option<u64> {
+        env.storage().persistent().get(&StorageKey::ExpiryWindow)
+    }
+
+    /// Persist the `Pending` expiry window in seconds.
+    pub fn set_expiry_window(env: &Env, seconds: u64) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::ExpiryWindow, &seconds);
+    }
+
+    // ── Standby signer ────────────────────────────────────────────────────────
+
+    /// Read the admin-approved standby relay signer, if any.
+    pub fn get_standby_signer(env: &Env) -> Option<Address> {
+        env.storage().persistent().get(&StorageKey::StandbySigner)
+    }
+
+    /// Persist the admin-approved standby relay signer.
+    pub fn set_standby_signer(env: &Env, signer: &Address) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::StandbySigner, signer);
+    }
+
     fn index_push(env: &Env, status: &TransactionStatus, id: &String) {
         let key = StorageKey::StatusIndex(status.clone());
         let mut ids = env

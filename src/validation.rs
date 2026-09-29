@@ -47,6 +47,10 @@ const MAX_CALLBACK_STATUS_LEN: u32 = 32;
 const MAX_STELLAR_TX_HASH_LEN: u32 = 72;
 /// Maximum length for `failure_reason` (short human-readable code).
 const MAX_FAILURE_REASON_LEN: u32 = 64;
+/// Maximum length of a single transaction tag.
+pub const MAX_TAG_LEN: u32 = 32;
+/// Maximum number of tags per transaction.
+pub const MAX_TAGS_PER_TX: u32 = 8;
 
 /// Encoded ed25519 public-key strkey length (SEP-23).
 const STRKEY_ENCODED_LEN: u32 = 56;
@@ -229,6 +233,29 @@ impl Validator {
     /// Failure reason: max length enforced for rent cost control.
     pub fn validate_failure_reason(reason: &String) -> Result<(), ContractError> {
         enforce_max_length(reason, MAX_FAILURE_REASON_LEN)
+    }
+
+    /// Tag: non-empty, length-capped, and the tx must have room for one more.
+    pub fn validate_tag(tag: &String, existing_count: u32) -> Result<(), ContractError> {
+        if tag.len() == 0 {
+            return Err(ContractError::EmptyTag);
+        }
+        enforce_max_length(tag, MAX_TAG_LEN)?;
+        if existing_count >= MAX_TAGS_PER_TX {
+            return Err(ContractError::TooManyTags);
+        }
+        Ok(())
+    }
+
+    /// Partial settlement: require `0 < settled < original`.
+    ///
+    /// Equal amounts must use `complete_transaction`; greater amounts are a
+    /// different bug class and are rejected too.
+    pub fn validate_settled_amount(settled: i128, original: i128) -> Result<(), ContractError> {
+        if settled <= 0 || settled >= original {
+            return Err(ContractError::InvalidSettledAmount);
+        }
+        Ok(())
     }
 
     /// Reject nominating the contract's own address as the next admin.

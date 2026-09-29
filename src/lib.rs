@@ -147,6 +147,10 @@ impl SynapseCoreContract {
             callback_status: payload.callback_status.clone(),
             stellar_tx_hash: String::from_str(&env, ""),
             failure_reason: String::from_str(&env, ""),
+            registered_at: env.ledger().timestamp(),
+            settled_amount: None,
+            assigned_signer: None,
+            tags: Vec::new(&env),
             retry_count: 0,
         };
 
@@ -259,10 +263,10 @@ impl SynapseCoreContract {
         stellar_tx_hash: String,
         caller: Address,
     ) -> Result<(), ContractError> {
-        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
         Validator::validate_stellar_tx_hash(&stellar_tx_hash)?;
 
         let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
+        AdminClient::assert_can_drive_tx(&env, &caller, &tx.assigned_signer)?;
         if tx.status != TransactionStatus::Processing {
             return Err(ContractError::InvalidStatusTransition);
         }
@@ -275,6 +279,129 @@ impl SynapseCoreContract {
         EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Completed);
         EventEmitter::transaction_completed(&env, &tx_id, &stellar_tx_hash);
 
+        Ok(())
+    }
+
+    /// Mark a `Processing` transaction as `Completed` with a settled amount
+    /// strictly between zero and the originally registered amount.
+    ///
+    /// Purely a recording mechanism: the shortfall is not refunded or fee'd
+    /// here. `complete_transaction` remains the full-amount path.
+    ///
+    /// # Events
+    /// Emits [`events::EventStatusChanged`] then
+    /// [`events::EventTransactionPartiallyCompleted`].
+    pub fn partial_complete_transaction(
+        env: Env,
+        tx_id: String,
+        settled_amount: i128,
+        stellar_tx_hash: String,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        Validator::validate_stellar_tx_hash(&stellar_tx_hash)?;
+
+        let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
+        AdminClient::assert_can_drive_tx(&env, &caller, &tx.assigned_signer)?;
+        if tx.status != TransactionStatus::Processing {
+            return Err(ContractError::InvalidStatusTransition);
+        }
+        Validator::validate_settled_amount(settled_amount, tx.amount)?;
+        let old_status = tx.status.clone();
+        tx.status = TransactionStatus::Completed;
+        tx.stellar_tx_hash = stellar_tx_hash.clone();
+        tx.settled_amount = Some(settled_amount);
+        tx.updated_at_ledger = env.ledger().sequence();
+
+        StorageClient::save_transaction(&env, &tx);
+        EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Completed);
+        EventEmitter::transaction_partially_completed(
+            &env,
+            &tx_id,
+            tx.amount,
+            settled_amount,
+            &stellar_tx_hash,
+        );
+        Ok(())
+    }
+
+    /// Approve a standby relay signer that in-flight transactions may be
+    /// reassigned to. Admin-gated.
+    ///
+    /// TODO: superseded by the N-of-M relay-signer set once that lands.
+    pub fn set_standby_signer(env: Env, signer: Address) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        StorageClient::set_standby_signer(&env, &signer);
+        EventEmitter::standby_signer_set(&env, &signer);
+        Ok(())
+    }
+
+    /// Rebind one in-flight (`Pending`/`Processing`) transaction's
+    /// authorization to `new_signer`. Admin-gated recovery path for a revoked
+    /// or compromised signer; does not touch global relay-signer state.
+    ///
+    /// `new_signer` must be the current relay signer or the admin-approved
+    /// standby (TODO: gate on the signer set once it exists).
+    ///
+    /// # Errors
+    /// - [`ContractError::InvalidStatusTransition`] if the transaction is terminal.
+    /// - [`ContractError::SignerNotTrusted`] if `new_signer` is not trusted.
+    ///
+    /// # Events
+    /// Emits [`events::EventTransactionReassigned`].
+    pub fn reassign_relay_signer_for_transaction(
+        env: Env,
+        tx_id: String,
+        new_signer: Address,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        let admin = StorageClient::get_admin(&env)?;
+        if caller != admin {
+            return Err(ContractError::Unauthorised);
+        }
+        caller.require_auth();
+
+        let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
+        if tx.status != TransactionStatus::Pending && tx.status != TransactionStatus::Processing {
+            return Err(ContractError::InvalidStatusTransition);
+        }
+        let relay = StorageClient::get_relay_signer(&env)?;
+        let standby = StorageClient::get_standby_signer(&env);
+        if new_signer != relay && standby.as_ref() != Some(&new_signer) {
+            return Err(ContractError::SignerNotTrusted);
+        }
+        let old_signer = tx.assigned_signer.clone().unwrap_or(relay);
+        tx.assigned_signer = Some(new_signer.clone());
+        tx.updated_at_ledger = env.ledger().sequence();
+
+        StorageClient::save_transaction(&env, &tx);
+        EventEmitter::transaction_reassigned(&env, &tx_id, &old_signer, &new_signer);
+        Ok(())
+    }
+
+    /// Append an operational tag to a transaction. Admin or relay signer.
+    ///
+    /// Append-only; count and per-tag length are capped in `validation.rs`.
+    ///
+    /// # Errors
+    /// - [`ContractError::TransactionNotFound`] for an unknown `tx_id`.
+    /// - [`ContractError::TooManyTags`] once the per-transaction cap is hit.
+    /// - [`ContractError::StringTooLong`] / [`ContractError::EmptyTag`] for a bad tag.
+    ///
+    /// # Events
+    /// Emits [`events::EventTransactionTagged`].
+    pub fn add_transaction_tag(
+        env: Env,
+        tx_id: String,
+        tag: String,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
+        let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
+        Validator::validate_tag(&tag, tx.tags.len())?;
+        tx.tags.push_back(tag.clone());
+
+        StorageClient::save_transaction(&env, &tx);
+        EventEmitter::transaction_tagged(&env, &tx_id, &tag, tx.tags.len());
         Ok(())
     }
 
@@ -303,6 +430,56 @@ impl SynapseCoreContract {
         StorageClient::save_transaction(&env, &tx);
         EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Failed);
         EventEmitter::transaction_failed(&env, &tx_id, &reason);
+
+        Ok(())
+    }
+
+    /// Set the maximum age (seconds) a `Pending` transaction may reach before
+    /// anyone can expire it. Admin-gated. `0` is rejected as invalid.
+    pub fn set_expiry_window(env: Env, seconds: u64) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        if seconds == 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        StorageClient::set_expiry_window(&env, seconds);
+        EventEmitter::expiry_window_set(&env, seconds);
+        Ok(())
+    }
+
+    /// Return the configured `Pending` expiry window in seconds, if any.
+    pub fn expiry_window(env: Env) -> Option<u64> {
+        StorageClient::get_expiry_window(&env)
+    }
+
+    /// Move a stale `Pending` transaction to terminal `Expired`.
+    ///
+    /// Deliberately **permissionless** (no auth): expiry is a pure function of
+    /// ledger time versus the admin-configured window, so anyone may trigger
+    /// it and no privileged off-chain scheduler is needed. Only `Pending`
+    /// transactions can expire; `Processing` implies active relay engagement.
+    ///
+    /// # Errors
+    /// - [`ContractError::ExpiryNotConfigured`] if no window is set.
+    /// - [`ContractError::InvalidStatusTransition`] if not `Pending`.
+    /// - [`ContractError::ExpiryNotElapsed`] if `now < registered_at + window`.
+    pub fn expire_transaction(env: Env, tx_id: String) -> Result<(), ContractError> {
+        let window =
+            StorageClient::get_expiry_window(&env).ok_or(ContractError::ExpiryNotConfigured)?;
+        let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
+        if tx.status != TransactionStatus::Pending {
+            return Err(ContractError::InvalidStatusTransition);
+        }
+        let deadline = tx.registered_at.saturating_add(window);
+        if env.ledger().timestamp() < deadline {
+            return Err(ContractError::ExpiryNotElapsed);
+        }
+        let old_status = tx.status.clone();
+        tx.status = TransactionStatus::Expired;
+        tx.updated_at_ledger = env.ledger().sequence();
+
+        StorageClient::save_transaction(&env, &tx);
+        EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Expired);
+        EventEmitter::transaction_expired(&env, &tx_id, tx.registered_at);
 
         Ok(())
     }
@@ -377,6 +554,8 @@ impl SynapseCoreContract {
         );
         EventEmitter::transaction_retried(&env, &tx_id, tx.retry_count);
 
+        Ok(())
+    }
         Ok(())
     }
 
