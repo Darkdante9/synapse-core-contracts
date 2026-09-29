@@ -150,12 +150,27 @@ impl Validator {
     pub fn validate_payload(env: &Env, payload: &CallbackPayload) -> Result<(), ContractError> {
         Self::validate_stellar_account(env, &payload.stellar_account)?;
         Self::validate_amount(payload.amount)?;
+        Self::validate_amount_ceiling(env, &payload.asset_issuer, payload.amount)?;
         Self::validate_asset_code(env, &payload.asset_code)?;
         Self::validate_asset_issuer(env, &payload.asset_issuer)?;
         Self::validate_idempotency_key(env, &payload.idempotency_key)?;
         Self::validate_transaction_id(&payload.transaction_id)?;
         Self::validate_anchor_transaction_id(&payload.anchor_transaction_id)?;
         Self::validate_callback_status(&payload.callback_status)?;
+        Ok(())
+    }
+
+    /// Reject amounts above the per-anchor ceiling (anchor = `asset_issuer`);
+    /// anchors without an explicit entry use the contract-wide default.
+    /// Exactly-at-ceiling is allowed.
+    pub fn validate_amount_ceiling(
+        env: &Env,
+        anchor: &String,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        if amount > crate::storage::StorageClient::get_amount_ceiling(env, anchor) {
+            return Err(ContractError::AmountCeilingExceeded);
+        }
         Ok(())
     }
 

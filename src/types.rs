@@ -17,6 +17,11 @@ use soroban_sdk::{contracterror, contracttype, Address, String, Vec};
 /// or an unexpected on-chain state, not against an incompatible new binary.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Contract-wide default max amount (stroops) for anchors (keyed by
+/// `asset_issuer`) with no explicit ceiling: 10^15 stroops (100M units at 7
+/// decimals). Admin may override via `set_default_amount_ceiling`.
+pub const DEFAULT_AMOUNT_CEILING: i128 = 1_000_000_000_000_000;
+
 /// Maximum number of times a `Failed` transaction may be retried.
 pub const MAX_RETRIES: u32 = 3;
 
@@ -179,6 +184,23 @@ pub struct CallbackPayload {
     pub callback_status: String,
 }
 
+/// One entry in a transaction's append-only lifecycle history.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionRecord {
+    /// Status the transaction entered.
+    pub status: TransactionStatus,
+    /// Address that drove the transition.
+    pub caller: Address,
+    /// Ledger close timestamp of the transition.
+    pub timestamp: u64,
+}
+
+/// Maximum history entries kept per transaction. When exceeded the oldest
+/// entry is evicted (drop-oldest, keep-newest); history loss never blocks a
+/// state transition.
+pub const MAX_HISTORY_LEN: u32 = 32;
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 /// Discriminants used as ledger storage keys.
@@ -219,6 +241,13 @@ pub enum StorageKey {
     /// Per-status index: ordered `Vec<String>` of transaction IDs currently in
     /// that status. Maintained by `StorageClient::save_transaction`.
     StatusIndex(TransactionStatus),
+    History(String),
+    MaxPendingPerSigner,
+    PendingCount(Address),
+    TxSigner(String),
+    Disputed(String),
+    AnchorCeiling(String),
+    DefaultCeiling,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -297,23 +326,37 @@ pub enum ContractError {
     /// aborted before touching contract WASM.
     SchemaVersionMismatch = 60,
 
+    // ── Backpressure ────────────────────────────────────────────────────────
+    /// Relay signer already has the maximum allowed outstanding `Pending` transactions.
+    OutstandingCapExceeded = 70,
+
     // ── Expiry ──────────────────────────────────────────────────────────────
     /// `expire_transaction` was called but no expiry window is configured.
-    ExpiryNotConfigured = 70,
+    ExpiryNotConfigured = 71,
     /// `expire_transaction` was called before the expiry window elapsed.
-    ExpiryNotElapsed = 71,
+    ExpiryNotElapsed = 72,
+
+    // ── Disputes ────────────────────────────────────────────────────────────
+    /// Transaction is already under dispute.
+    AlreadyDisputed = 80,
+    /// Transaction is not under dispute.
+    NotDisputed = 81,
 
     // ── Partial settlement ──────────────────────────────────────────────────
     /// `settled_amount` is not strictly between zero and the original amount.
-    InvalidSettledAmount = 80,
+    InvalidSettledAmount = 82,
 
     // ── Signer reassignment ─────────────────────────────────────────────────
     /// `new_signer` is neither the relay signer nor the approved standby.
-    SignerNotTrusted = 81,
+    SignerNotTrusted = 83,
 
     // ── Tagging ─────────────────────────────────────────────────────────────
     /// The transaction already carries the maximum number of tags.
     TooManyTags = 90,
     /// The tag is empty.
     EmptyTag = 91,
+
+    // ── Amount ceilings ─────────────────────────────────────────────────────
+    /// Amount exceeds the anchor's (or the default) ceiling.
+    AmountCeilingExceeded = 92,
 }

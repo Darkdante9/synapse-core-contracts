@@ -132,6 +132,13 @@ impl SynapseCoreContract {
             return Err(ContractError::DuplicateRequest);
         }
 
+        // Backpressure: bound this signer's outstanding Pending backlog.
+        if let Some(cap) = StorageClient::get_max_pending_per_signer(&env) {
+            if StorageClient::get_pending_count(&env, &relay) >= cap {
+                return Err(ContractError::OutstandingCapExceeded);
+            }
+        }
+
         let ledger = env.ledger().sequence();
         let tx = Transaction {
             id: payload.transaction_id.clone(),
@@ -156,6 +163,8 @@ impl SynapseCoreContract {
 
         StorageClient::save_transaction(&env, &tx);
         StorageClient::set_idempotency_key(&env, &payload.idempotency_key);
+        StorageClient::append_history(&env, &tx.id, TransactionStatus::Pending, &relay);
+        StorageClient::inc_pending(&env, &relay, &tx.id);
         EventEmitter::transaction_registered(&env, &tx);
 
         Ok(tx.id)
@@ -248,6 +257,8 @@ impl SynapseCoreContract {
         tx.updated_at_ledger = env.ledger().sequence();
 
         StorageClient::save_transaction(&env, &tx);
+        StorageClient::append_history(&env, &tx_id, TransactionStatus::Processing, &caller);
+        StorageClient::dec_pending(&env, &tx_id);
         EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Processing);
 
         Ok(())
@@ -276,6 +287,7 @@ impl SynapseCoreContract {
         tx.updated_at_ledger = env.ledger().sequence();
 
         StorageClient::save_transaction(&env, &tx);
+        StorageClient::append_history(&env, &tx_id, TransactionStatus::Completed, &caller);
         EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Completed);
         EventEmitter::transaction_completed(&env, &tx_id, &stellar_tx_hash);
 
@@ -428,10 +440,71 @@ impl SynapseCoreContract {
         tx.updated_at_ledger = env.ledger().sequence();
 
         StorageClient::save_transaction(&env, &tx);
+        StorageClient::append_history(&env, &tx_id, TransactionStatus::Failed, &caller);
+        if old_status == TransactionStatus::Pending {
+            StorageClient::dec_pending(&env, &tx_id);
+        }
         EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Failed);
         EventEmitter::transaction_failed(&env, &tx_id, &reason);
 
         Ok(())
+    }
+
+    // ── Disputes ──────────────────────────────────────────────────────────────
+
+    /// Freeze a `Completed` transaction pending review.
+    ///
+    /// Disputed is an overlay flag; the stored status stays `Completed` so
+    /// nothing is lost. Callable by the relay signer or admin.
+    ///
+    /// # Errors
+    /// - [`ContractError::InvalidStatusTransition`] if not `Completed`.
+    /// - [`ContractError::AlreadyDisputed`] if already disputed.
+    pub fn dispute_transaction(
+        env: Env,
+        tx_id: String,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
+        let tx = StorageClient::get_transaction(&env, &tx_id)?;
+        if tx.status != TransactionStatus::Completed {
+            return Err(ContractError::InvalidStatusTransition);
+        }
+        if StorageClient::is_disputed(&env, &tx_id) {
+            return Err(ContractError::AlreadyDisputed);
+        }
+        StorageClient::set_disputed(&env, &tx_id, true);
+        Ok(())
+    }
+
+    /// Resolve a dispute. **Admin only** — unlike every other lifecycle
+    /// action this is deliberately NOT relay-signer-eligible.
+    ///
+    /// If `upheld`, the transaction moves `Completed -> Failed` with reason
+    /// `dispute_upheld`; otherwise the flag is cleared and the transaction
+    /// is exactly as it was (`Completed`).
+    pub fn resolve_dispute(env: Env, tx_id: String, upheld: bool) -> Result<(), ContractError> {
+        let admin = AdminClient::require_admin(&env)?;
+        let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
+        if !StorageClient::is_disputed(&env, &tx_id) {
+            return Err(ContractError::NotDisputed);
+        }
+        StorageClient::set_disputed(&env, &tx_id, false);
+        if upheld {
+            let old_status = tx.status.clone();
+            tx.status = TransactionStatus::Failed;
+            tx.failure_reason = String::from_str(&env, "dispute_upheld");
+            tx.updated_at_ledger = env.ledger().sequence();
+            StorageClient::save_transaction(&env, &tx);
+            StorageClient::append_history(&env, &tx_id, TransactionStatus::Failed, &admin);
+            EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Failed);
+        }
+        Ok(())
+    }
+
+    /// Whether `tx_id` is currently under dispute.
+    pub fn is_disputed(env: Env, tx_id: String) -> bool {
+        StorageClient::is_disputed(&env, &tx_id)
     }
 
     /// Set the maximum age (seconds) a `Pending` transaction may reach before
@@ -556,8 +629,6 @@ impl SynapseCoreContract {
 
         Ok(())
     }
-        Ok(())
-    }
 
     // ── Read-only queries ─────────────────────────────────────────────────────
 
@@ -593,6 +664,14 @@ impl SynapseCoreContract {
     /// Return the current [`TransactionStatus`] without fetching the full record.
     pub fn get_status(env: Env, tx_id: String) -> Result<TransactionStatus, ContractError> {
         StorageClient::get_transaction(&env, &tx_id).map(|tx| tx.status)
+    }
+
+    /// Return the append-only transition history of `tx_id`, oldest first.
+    ///
+    /// Holds at most [`types::MAX_HISTORY_LEN`] entries (oldest evicted first).
+    /// Transactions registered before this feature have no history.
+    pub fn get_transaction_history(env: Env, tx_id: String) -> Vec<TransitionRecord> {
+        StorageClient::get_history(&env, &tx_id)
     }
 
     /// Check whether an idempotency key has already been processed.
@@ -678,6 +757,52 @@ impl SynapseCoreContract {
         StorageClient::clear_pending_admin(&env);
         EventEmitter::admin_transferred(&env, &old_admin, &caller);
         Ok(())
+    }
+
+    /// Set the maximum outstanding `Pending` transactions any single relay
+    /// signer may hold. Admin-gated. `register_callback` fails with
+    /// [`ContractError::OutstandingCapExceeded`] once a signer is at the cap.
+    /// Lowering the cap never affects already-registered transactions.
+    pub fn set_max_outstanding_pending_per_signer(
+        env: Env,
+        cap: u32,
+    ) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        StorageClient::set_max_pending_per_signer(&env, cap);
+        Ok(())
+    }
+
+    /// Return the outstanding `Pending` count for `signer`.
+    pub fn outstanding_pending(env: Env, signer: Address) -> u32 {
+        StorageClient::get_pending_count(&env, &signer)
+    }
+
+    /// Set the max registerable amount for an anchor (identified by the
+    /// payload's `asset_issuer`). Admin-gated. Applies to future
+    /// registrations only; existing transactions are unaffected.
+    pub fn set_anchor_amount_ceiling(
+        env: Env,
+        anchor: String,
+        ceiling: i128,
+    ) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        Validator::validate_amount(ceiling)?;
+        StorageClient::set_anchor_ceiling(&env, &anchor, ceiling);
+        Ok(())
+    }
+
+    /// Set the default ceiling for anchors with no explicit entry (initially
+    /// [`types::DEFAULT_AMOUNT_CEILING`]). Admin-gated.
+    pub fn set_default_amount_ceiling(env: Env, ceiling: i128) -> Result<(), ContractError> {
+        AdminClient::require_admin(&env)?;
+        Validator::validate_amount(ceiling)?;
+        StorageClient::set_default_ceiling(&env, ceiling);
+        Ok(())
+    }
+
+    /// Return the effective amount ceiling for `anchor`.
+    pub fn get_amount_ceiling(env: Env, anchor: String) -> i128 {
+        StorageClient::get_amount_ceiling(&env, &anchor)
     }
 
     /// Rotate the trusted relay signer address.

@@ -14,7 +14,9 @@
 
 use soroban_sdk::{Address, Env, String, Vec};
 
-use crate::types::{ContractError, StorageKey, Transaction, TransactionStatus};
+use crate::types::{
+    DEFAULT_AMOUNT_CEILING, ContractError, StorageKey, Transaction, TransactionStatus, TransitionRecord, MAX_HISTORY_LEN,
+};
 
 /// TTL extension in ledgers applied to idempotency keys (~24 hours at ~5s/ledger).
 ///
@@ -185,6 +187,137 @@ impl StorageClient {
             TRANSACTION_MIN_TTL_LEDGERS,
             TRANSACTION_MIN_TTL_LEDGERS,
         );
+    }
+
+    // ── Transaction history ───────────────────────────────────────────────────
+
+    /// Append a transition record to the transaction's history (persistent).
+    ///
+    /// Bounded at [`MAX_HISTORY_LEN`]; once full the oldest entry is dropped
+    /// so the newest are kept and the transition itself is never blocked.
+    pub fn append_history(env: &Env, tx_id: &String, status: TransactionStatus, caller: &Address) {
+        let key = StorageKey::History(tx_id.clone());
+        let mut h: Vec<TransitionRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if h.len() >= MAX_HISTORY_LEN {
+            h.pop_front();
+        }
+        h.push_back(TransitionRecord {
+            status,
+            caller: caller.clone(),
+            timestamp: env.ledger().timestamp(),
+        });
+        env.storage().persistent().set(&key, &h);
+        env.storage().persistent().extend_ttl(
+            &key,
+            TRANSACTION_MIN_TTL_LEDGERS,
+            TRANSACTION_MIN_TTL_LEDGERS,
+        );
+    }
+
+    /// Read a transaction's history, oldest first (empty if none recorded).
+    pub fn get_history(env: &Env, tx_id: &String) -> Vec<TransitionRecord> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::History(tx_id.clone()))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    // ── Per-signer outstanding-Pending cap ────────────────────────────────────
+
+    /// Configured cap on outstanding `Pending` transactions per signer
+    /// (`None` = unlimited).
+    pub fn get_max_pending_per_signer(env: &Env) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::MaxPendingPerSigner)
+    }
+
+    /// Persist the per-signer outstanding-Pending cap.
+    pub fn set_max_pending_per_signer(env: &Env, cap: u32) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::MaxPendingPerSigner, &cap);
+    }
+
+    /// Current outstanding `Pending` count for `signer`.
+    pub fn get_pending_count(env: &Env, signer: &Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::PendingCount(signer.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Record that `signer` registered `tx_id` and bump its counter.
+    pub fn inc_pending(env: &Env, signer: &Address, tx_id: &String) {
+        let n = Self::get_pending_count(env, signer) + 1;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::PendingCount(signer.clone()), &n);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::TxSigner(tx_id.clone()), signer);
+    }
+
+    /// Decrement the counter of the signer that registered `tx_id`, called
+    /// when the transaction leaves `Pending`. Never underflows.
+    pub fn dec_pending(env: &Env, tx_id: &String) {
+        let key = StorageKey::TxSigner(tx_id.clone());
+        if let Some(signer) = env.storage().persistent().get::<StorageKey, Address>(&key) {
+            let n = Self::get_pending_count(env, &signer);
+            debug_assert!(n > 0, "pending counter underflow");
+            env.storage().persistent().set(
+                &StorageKey::PendingCount(signer),
+                &n.saturating_sub(1),
+            );
+            env.storage().persistent().remove(&key);
+        }
+    }
+
+    // ── Dispute overlay flag ──────────────────────────────────────────────────
+
+    /// Whether `tx_id` is currently flagged as disputed (overlay on status).
+    pub fn is_disputed(env: &Env, tx_id: &String) -> bool {
+        env.storage()
+            .persistent()
+            .has(&StorageKey::Disputed(tx_id.clone()))
+    }
+
+    /// Set or clear the dispute overlay flag.
+    pub fn set_disputed(env: &Env, tx_id: &String, disputed: bool) {
+        let key = StorageKey::Disputed(tx_id.clone());
+        if disputed {
+            env.storage().persistent().set(&key, &true);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+    }
+
+    // ── Amount ceilings ───────────────────────────────────────────────────────
+
+    /// Effective ceiling for `anchor`: explicit entry, else the default.
+    pub fn get_amount_ceiling(env: &Env, anchor: &String) -> i128 {
+        let p = env.storage().persistent();
+        p.get(&StorageKey::AnchorCeiling(anchor.clone()))
+            .or_else(|| p.get(&StorageKey::DefaultCeiling))
+            .unwrap_or(DEFAULT_AMOUNT_CEILING)
+    }
+
+    /// Set an explicit ceiling for `anchor`.
+    pub fn set_anchor_ceiling(env: &Env, anchor: &String, ceiling: i128) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::AnchorCeiling(anchor.clone()), &ceiling);
+    }
+
+    /// Set the default ceiling for anchors without an explicit entry.
+    pub fn set_default_ceiling(env: &Env, ceiling: i128) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::DefaultCeiling, &ceiling);
     }
 
     // ── Expiry window ─────────────────────────────────────────────────────────
